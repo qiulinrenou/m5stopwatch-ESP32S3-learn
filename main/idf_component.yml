@@ -1,0 +1,12 @@
+dependencies:
+  idf:
+    version: '>=6.0.0'
+  espressif/esp_lvgl_adapter:
+    version: 0.4.*
+    public: true
+  lvgl/lvgl:
+    version: 8.4.*
+    public: true
+  espressif/esp_lcd_co5300:
+    version: 2.0.*
+    public: true
