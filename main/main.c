@@ -10,12 +10,14 @@
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_panel_vendor.h"
 #include "esp_lcd_touch.h"
-#include "esp_lcd_touch_cst820.h"
 #include "esp_log.h"
 
 #include "esp_lv_adapter.h"
 #include "lvgl.h"
 #include "watch_ui.h"
+
+#include "watch_board.h"                                  // 使用统一屏幕和触摸配置
+#include "touch_port.h"                                  // 使用 watch_board 的触摸初始化接口
 
 #include "board_power.h"
 #include "co5300_init_cmds.h"
@@ -32,13 +34,9 @@ static const char *TAG = "M5STOPWATCH";
 #define LCD_PIN_TE      GPIO_NUM_38
 
 // 触摸中断由 ESP32 直接接收；触摸复位由 M5IOE1 IO4 控制。
-#define TOUCH_PIN_INT       GPIO_NUM_13
-#define TOUCH_I2C_CLK_HZ    (400 * 1000)
 
 #define LCD_HOST            SPI2_HOST
 #define LCD_PIXEL_CLOCK_HZ  (40 * 1000 * 1000)
-#define LCD_H_RES           466
-#define LCD_V_RES           466
 #define LCD_X_GAP           6
 #define LCD_Y_GAP           0
 
@@ -66,7 +64,7 @@ static void init_display(esp_lcd_panel_io_handle_t *panel_io_out,
         LCD_PIN_D1,
         LCD_PIN_D2,
         LCD_PIN_D3,
-        LCD_H_RES * 80 * sizeof(uint16_t));
+        WATCH_LCD_H_RES * 80 * sizeof(uint16_t));
     ESP_ERROR_CHECK(spi_bus_initialize(LCD_HOST, &bus_config, SPI_DMA_CH_AUTO));
 
     esp_lcd_panel_io_spi_config_t io_config = {
@@ -108,43 +106,23 @@ static void init_display(esp_lcd_panel_io_handle_t *panel_io_out,
     ESP_ERROR_CHECK(esp_lcd_panel_co5300_set_brightness(*panel_out, 80));
 
     ESP_LOGI(TAG, "CO5300 QSPI 显示初始化完成 (%dx%d)，TE=%d",
-             LCD_H_RES, LCD_V_RES, LCD_PIN_TE);
+                WATCH_LCD_H_RES, WATCH_LCD_V_RES, LCD_PIN_TE);
 }
 
 static esp_lcd_touch_handle_t init_touch(void)
 {
-    i2c_master_bus_handle_t i2c_bus = board_power_get_i2c_bus();
-    assert(i2c_bus != NULL);
+    i2c_master_bus_handle_t i2c_bus =                                                             // 获取共享 I2C 总线
+    board_power_get_i2c_bus();                                                                   // board_power_init() 配套使用
+    assert(i2c_bus != NULL);                                                                    //检查共享 I2C 是否有效
 
     // CST820、M5PM1 和 M5IOE1 必须共用这一条 I2C 总线，不能重复安装驱动。
-    ESP_ERROR_CHECK(board_power_reset_touch());
-
-    esp_lcd_panel_io_i2c_config_t touch_io_config = ESP_LCD_TOUCH_IO_I2C_CST820_CONFIG();
-    touch_io_config.scl_speed_hz = TOUCH_I2C_CLK_HZ;
-
-    esp_lcd_panel_io_handle_t touch_io = NULL;
-    ESP_ERROR_CHECK(esp_lcd_new_panel_io_i2c(i2c_bus, &touch_io_config, &touch_io));
-
-    esp_lcd_touch_config_t touch_config = {
-        .x_max = LCD_H_RES,
-        .y_max = LCD_V_RES,
-        // 复位由 M5IOE1 IO4 完成，禁止触摸驱动操作 GPIO40(QSPI SCK)。
-        .rst_gpio_num = GPIO_NUM_NC,
-        .int_gpio_num = TOUCH_PIN_INT,
-        .levels = {
-            .reset = 0,
-            .interrupt = 0,
-        },
-        .flags = {
-            .swap_xy = 0,
-            .mirror_x = 0,
-            .mirror_y = 0,
-        },
-    };
+    ESP_ERROR_CHECK(                                                                            // 保持原来的触摸复位时序
+        board_power_reset_touch()                                                               // 由 M5IOE1 控制 CST820 复位
+    );
 
     esp_lcd_touch_handle_t touch_handle = NULL;
-    ESP_ERROR_CHECK(esp_lcd_touch_new_i2c_cst820(touch_io, &touch_config, &touch_handle));
-    ESP_LOGI(TAG, "CST820 触摸初始化完成，中断 GPIO=%d", TOUCH_PIN_INT);
+    ESP_ERROR_CHECK(touch_port_init(i2c_bus, &touch_handle));
+    ESP_LOGI(TAG, "CST820 触摸初始化完成，中断 GPIO=%d", WATCH_TOUCH_PIN_INT);
     return touch_handle;
 }
 
@@ -160,8 +138,8 @@ static void init_lvgl(esp_lcd_panel_io_handle_t panel_io,
         ESP_LV_ADAPTER_DISPLAY_SPI_WITH_PSRAM_DEFAULT_CONFIG(
             panel_handle,
             panel_io,
-            LCD_H_RES,
-            LCD_V_RES,
+            WATCH_LCD_H_RES,
+            WATCH_LCD_V_RES,
             ESP_LV_ADAPTER_ROTATE_0);
     lv_display_t *display = esp_lv_adapter_register_display(&display_config);
     assert(display != NULL);
