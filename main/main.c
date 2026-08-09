@@ -1,18 +1,13 @@
 #include <assert.h>
 #include <stdio.h>
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
-
 #include "esp_err.h"
 #include "esp_lcd_panel_io.h"
 #include "esp_lcd_touch.h"
 #include "esp_log.h"
 
-#include "esp_lv_adapter.h"
-#include "lvgl.h"
+#include "watch_lvgl.h"                              // 使用统一LVGL
 #include "watch_ui.h"
-
 #include "watch_board.h"                                  // 使用统一屏幕和触摸配置
 #include "touch_port.h"                                  // 使用 watch_board 的触摸初始化接口
 #include "display_port.h"
@@ -20,18 +15,6 @@
 #include "board_power.h"
 
 static const char *TAG = "M5STOPWATCH";
-
-/**
- * @brief CO5300 要求刷新区域的起点为偶数、终点为奇数。
- */
-static void co5300_area_rounder_cb(lv_area_t *area, void *user_data)
-{
-    (void)user_data;
-    area->x1 = (area->x1 >> 1) << 1;
-    area->y1 = (area->y1 >> 1) << 1;
-    area->x2 = ((area->x2 >> 1) << 1) + 1;
-    area->y2 = ((area->y2 >> 1) << 1) + 1;
-}
 
 static esp_lcd_touch_handle_t init_touch(void)
 {
@@ -48,66 +31,6 @@ static esp_lcd_touch_handle_t init_touch(void)
     ESP_ERROR_CHECK(touch_port_init(i2c_bus, &touch_handle));
     ESP_LOGI(TAG, "CST820 触摸初始化完成，中断 GPIO=%d", WATCH_TOUCH_PIN_INT);
     return touch_handle;
-}
-
-static void init_lvgl(esp_lcd_panel_io_handle_t panel_io,
-                      esp_lcd_panel_handle_t panel_handle,
-                      esp_lcd_touch_handle_t touch_handle)
-{
-    esp_lv_adapter_config_t adapter_config = ESP_LV_ADAPTER_DEFAULT_CONFIG();
-    adapter_config.stack_in_psram = true;
-    ESP_ERROR_CHECK(esp_lv_adapter_init(&adapter_config));
-
-    esp_lv_adapter_display_config_t display_config =
-        ESP_LV_ADAPTER_DISPLAY_SPI_WITH_PSRAM_DEFAULT_CONFIG(
-            panel_handle,
-            panel_io,
-            WATCH_LCD_H_RES,
-            WATCH_LCD_V_RES,
-            ESP_LV_ADAPTER_ROTATE_0);
-    lv_display_t *display = esp_lv_adapter_register_display(&display_config);
-    assert(display != NULL);
-
-   ESP_ERROR_CHECK(esp_lv_adapter_lock(-1));                    // 获取 LVGL 互斥锁，-1 表示无限等待
-
-lv_obj_t *default_screen = lv_disp_get_scr_act(display);     // 在锁内获取当前显示的活动屏幕
-if (default_screen != NULL) {                                // 确认活动屏幕对象有效
-    lv_obj_remove_style_all(default_screen);                 // 删除活动屏幕的原有样式
-    lv_obj_set_style_bg_color(                               // 设置活动屏幕背景颜色
-        default_screen,
-        lv_color_black(),
-        LV_STATE_DEFAULT
-    );
-    lv_obj_set_style_bg_opa(                                 // 设置活动屏幕背景完全不透明
-        default_screen,
-        LV_OPA_COVER,
-        LV_STATE_DEFAULT
-    );
-    lv_obj_set_size(                                         // 设置活动屏幕覆盖整个显示区域
-        default_screen,
-        LV_PCT(100),
-        LV_PCT(100)
-    );
-}
-
-esp_lv_adapter_unlock();                                     // 完成 LVGL 对象操作后释放互斥锁
-
-    ESP_ERROR_CHECK(esp_lv_adapter_set_area_rounder_cb(
-        display, co5300_area_rounder_cb, NULL));
-
-    esp_lv_adapter_touch_config_t touch_config =
-        ESP_LV_ADAPTER_TOUCH_DEFAULT_CONFIG(display, touch_handle);
-    lv_indev_t *input_device = esp_lv_adapter_register_touch(&touch_config);
-    assert(input_device != NULL);
-
-    ESP_ERROR_CHECK(esp_lv_adapter_start());
-    ESP_LOGI(TAG, "LVGL 适配器启动成功");
-
-    // 保留目标工程原有界面；PMIC 和 IOE1 状态只通过串口日志输出。
-    if (esp_lv_adapter_lock(portMAX_DELAY) == ESP_OK) {
-        ui_init(display);
-        esp_lv_adapter_unlock();
-    }
 }
 
 void app_main(void)
@@ -134,7 +57,26 @@ void app_main(void)
         &panel_handle                        // 输出给 LVGL adapter 的面板句柄
     ) );
 
-    esp_lcd_touch_handle_t touch_handle = init_touch();   // 显示完成后初始化 CST820
-    init_lvgl(panel_io, panel_handle, touch_handle);      // 注册显示和触摸并启动 LVGL
+    esp_lcd_touch_handle_t touch_handle =
+        init_touch();                                   // 创建 CST820 硬件触摸句柄
+
+    watch_lvgl_config_t lvgl_config = {
+        .panel_io = panel_io,                           // 传入 display_port 创建的 Panel IO
+        .panel = panel_handle,                          // 传入 display_port 创建的 CO5300 面板
+        .touch = touch_handle,                          // 传入 touch_port 创建的 CST820
+        .horizontal_resolution = WATCH_LCD_H_RES,       // 设置 466 像素横向分辨率
+        .vertical_resolution = WATCH_LCD_V_RES,         // 设置 466 像素纵向分辨率
+        .horizontal_alignment = 2,                      // CO5300 横向刷新区域按 2 像素对齐
+        .vertical_alignment = 2,                        // CO5300 纵向刷新区域按 2 像素对齐
+        .rotation = WATCH_LVGL_ROTATION_0,               // 保持当前不旋转配置
+        .use_psram = true,                              // 使用当前设备的 PSRAM 双缓冲
+    };
+
+    ESP_ERROR_CHECK(
+        watch_lvgl_start(
+            &lvgl_config,                               // 传入硬件和显示配置
+            ui_init                                     // 在运行时内部的锁内创建 UI
+        )
+    );
 }
 
