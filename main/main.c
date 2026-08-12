@@ -8,9 +8,11 @@
 
 #include "watch_lvgl.h"                              // 使用统一LVGL
 #include "watch_ui.h"
+#include "watch_core.h"                              // 使用真实表盘数据协调任务
 #include "watch_board.h"                                  // 使用统一屏幕和触摸配置
 #include "touch_port.h"                                  // 使用 watch_board 的触摸初始化接口
 #include "display_port.h"
+#include "watch_rtc.h"                               // 使用 RX8130 实时时钟接口
 
 #include "board_power.h"
 
@@ -43,6 +45,23 @@ void app_main(void)
     ESP_LOGI(TAG, "板级管理芯片状态: M5PM1=%s, M5IOE1=%s",
              board_power_pmic_ready() ? "正常" : "不可用",
              board_power_ioe_ready() ? "正常" : "不可用");
+
+    i2c_master_bus_handle_t i2c_bus =                 // 获取板级模块已经创建的共享 I2C 总线
+        board_power_get_i2c_bus();
+    assert(i2c_bus != NULL);                          // 后续触摸和 RTC 都依赖这条总线
+
+    esp_err_t rtc_init_result =
+        watch_rtc_init(i2c_bus);                      // 探测 RX8130 并检查时间是否可信
+    if (rtc_init_result == ESP_ERR_INVALID_STATE) {
+        ESP_LOGW(TAG, "RX8130 没有合法时间，尝试使用本次固件编译时间恢复");
+        rtc_init_result = watch_rtc_restore_from_build_time(
+            8 * 60                                    // 当前编译电脑使用中国/香港标准时间 UTC+8
+        );
+    }
+    if (rtc_init_result != ESP_OK) {                  // RTC 无效不能阻止手表显示和其他功能启动
+        ESP_LOGW(TAG, "RX8130 当前不可用，表盘将显示大号 RTC 提示: %s",
+                 esp_err_to_name(rtc_init_result));
+    }
 
     esp_lcd_panel_io_handle_t panel_io = NULL;           // 接收显示模块创建的 Panel IO 句柄
     esp_lcd_panel_handle_t panel_handle = NULL;           // 接收显示模块创建的 CO5300 面板句柄
@@ -77,6 +96,17 @@ void app_main(void)
             &lvgl_config,                               // 传入硬件和显示配置
             ui_init                                     // 在运行时内部的锁内创建 UI
         )
+    );
+
+    const watch_core_config_t core_config = {
+        .rtc_reader = watch_rtc_get_datetime,         // 注入 RX8130 读取回调，避免 core 依赖硬件细节
+        .battery_reader = board_power_get_battery_percent, // 注入线程安全的滤波电量读取接口
+        .update_period_ms = 1000,                     // 每秒更新时间、电量和冒号闪烁状态
+        .timezone_offset_minutes = 8 * 60,            // RX8130 保存 UTC，香港/中国标准时间为 UTC+8
+    };
+
+    ESP_ERROR_CHECK(
+        watch_core_start(&core_config)                // LVGL 完全启动后再发布真实数据
     );
 }
 

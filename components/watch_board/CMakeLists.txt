@@ -2,6 +2,7 @@ idf_component_register(
     SRCS                                                 
         "src/touch_port.c"                  # CST820 触摸硬件初始化
         "src/display_port.c"                # CO5300 显示硬件初始化                               
+        "src/watch_rtc.c"                   # RX8130 实时时钟硬件访问与数据校验
     INCLUDE_DIRS                                         
         "include"                                        
     REQUIRES      

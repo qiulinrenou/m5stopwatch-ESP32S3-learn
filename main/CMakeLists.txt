@@ -12,4 +12,5 @@ idf_component_register(
         watch_ui            # 新增：main 依赖 watch_ui 组件
         watch_board         # main.c 使用 touch_port.h 和 touch_port_init()
         watch_lvgl                 # main 使用统一 LVGL 运行时
+        watch_core                 # main 组装 RTC、电量和主表盘数据任务
 )
