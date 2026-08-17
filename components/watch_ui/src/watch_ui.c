@@ -3,6 +3,7 @@
 #include <stdio.h>                                   // 提供 snprintf()
 #include <string.h>                                  // 提供 memset()
 
+#include "esp_log.h"                                // 提供菜单切换诊断日志
 #include "lvgl.h"                                   // 提供 LVGL 控件、样式和绘图接口
 
 #define WATCH_FACE_DIAL_SIZE        466              // 外圈使用完整 466 像素圆屏直径
@@ -17,6 +18,12 @@
 #define WATCH_FACE_TIME_WIDTH       300              // 固定主时间区域宽度，保证五个字符完整居中
 #define WATCH_FACE_TIME_HEIGHT       64              // 为 48 号字体保留稳定的实际绘制高度
 
+#define WATCH_MENU_CARD_WIDTH        320             // HTML 设置卡片宽度
+#define WATCH_MENU_CARD_HEIGHT       64              // HTML 设置卡片高度
+#define WATCH_MENU_ICON_SIZE         44              // HTML 彩色图标圆尺寸
+#define WATCH_MENU_CARD_GAP          12              // HTML 卡片垂直间距
+#define WATCH_MENU_PADDING_Y         55              // HTML 列表上下留白
+
 #define WATCH_COLOR_GREEN lv_color_hex(0x00E85C)     // 主表盘绿色
 #define WATCH_COLOR_RED   lv_color_hex(0xFF1745)     // 心率圆环红色
 #define WATCH_COLOR_BLUE  lv_color_hex(0x18B8FF)     // 天气圆环蓝色
@@ -25,12 +32,32 @@
 
 typedef struct {
     lv_display_t *display;                           // 保存当前 UI 所属的 Display
+    lv_obj_t *main_page;                             // 保存已验证的主表盘 LVGL screen
+    lv_obj_t *menu_page;                             // 设置菜单页面容器
+    lv_obj_t *menu_list;                             // 可滚动的设置项列表
     lv_obj_t *date_label;                            // 保存需要更新的日期标签
     lv_obj_t *time_label;                            // 保存需要更新的主时间标签
     lv_obj_t *battery_label;                         // 保存需要更新的真实电量标签
+    bool menu_visible;                                // 当前是否显示设置菜单
 } watch_ui_runtime_t;
 
 static watch_ui_runtime_t s_ui = {0};                // watch_ui 私有且唯一的运行状态
+static const char *TAG = "WATCH_UI";                 // 菜单切换诊断日志标签
+
+typedef struct {
+    const char *label;                                // 菜单项显示文字
+    const char *symbol;                               // LVGL 内置图标
+    uint32_t color;                                   // 图标圆背景 RGB888 颜色
+} watch_menu_item_spec_t;
+
+static const watch_menu_item_spec_t s_menu_items[] = {
+    {"Display",       LV_SYMBOL_EYE_OPEN,  0xFFAA00},
+    {"Vibration",     LV_SYMBOL_VOLUME_MID, 0x00D285},
+    {"DND Mode",      LV_SYMBOL_MUTE,      0x7C5CFF},
+    {"Power Save",    LV_SYMBOL_CHARGE,    0x2ED573},
+    {"Notifications",  LV_SYMBOL_BELL,      0xFF4757},
+    {"System",        LV_SYMBOL_SETTINGS,  0x1E90FF},
+};
 
 /*
  * lv_line_set_points() 不会复制坐标数组，因此这些数组必须在界面存活期间持续有效。
@@ -89,6 +116,131 @@ static lv_obj_t *create_label(
     lv_obj_clear_flag(label, LV_OBJ_FLAG_CLICKABLE);  // 主表盘文本不参与触摸命中测试
 
     return label;
+}
+
+/**
+ * @brief 创建设置菜单卡片左侧的彩色圆形图标。
+ *
+ * @param card 设置项卡片父对象。
+ * @param symbol LVGL 内置 FontAwesome 风格符号。
+ * @param color 图标圆背景颜色。
+ * @return 无返回值；对象生命周期由 LVGL 卡片父对象管理。
+ * @note 只在 ui_init() 的 LVGL 锁内调用，不访问硬件。
+ */
+static void create_menu_icon(
+    lv_obj_t *card,
+    const char *symbol,
+    lv_color_t color)
+{
+    lv_obj_t *icon = lv_obj_create(card);             // 创建 HTML icon-box 对应的圆形容器
+
+    lv_obj_remove_style_all(icon);                    // 移除 LVGL 默认边框和内边距
+    lv_obj_set_size(icon, WATCH_MENU_ICON_SIZE, WATCH_MENU_ICON_SIZE);
+    lv_obj_set_pos(icon, 16, 10);                     // 对应卡片左右 16、上下居中布局
+    lv_obj_set_style_radius(icon, LV_RADIUS_CIRCLE, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(icon, color, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(icon, LV_OPA_COVER, LV_STATE_DEFAULT);
+    lv_obj_clear_flag(icon, LV_OBJ_FLAG_CLICKABLE | LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *icon_label = lv_label_create(icon);     // 使用 LVGL 符号字体承载图标
+    lv_label_set_text(icon_label, symbol);
+    lv_obj_set_style_text_font(icon_label, &lv_font_montserrat_18, LV_STATE_DEFAULT);
+    lv_obj_set_style_text_color(icon_label, WATCH_COLOR_WHITE, LV_STATE_DEFAULT);
+    lv_obj_set_style_text_align(icon_label, LV_TEXT_ALIGN_CENTER, LV_STATE_DEFAULT);
+    lv_obj_center(icon_label);                        // 图标符号在彩色圆内居中
+    lv_obj_clear_flag(icon_label, LV_OBJ_FLAG_CLICKABLE);
+}
+
+/**
+ * @brief 创建一个 HTML 风格的设置菜单卡片。
+ *
+ * @param list 可滚动设置项列表父对象。
+ * @param spec 菜单项文字、图标和颜色规格。
+ * @return 无返回值；对象由列表父对象统一管理。
+ * @note 卡片和子对象均在 ui_init() 的 LVGL 锁内创建，触摸按下状态由 LVGL 管理。
+ */
+static void create_menu_item(
+    lv_obj_t *list,
+    const watch_menu_item_spec_t *spec)
+{
+    lv_obj_t *card = lv_obj_create(list);             // 创建对应 HTML menu-item 的 LVGL 对象
+
+    lv_obj_remove_style_all(card);                    // 保证背景、边框和内边距与 HTML 一致
+    lv_obj_set_size(card, WATCH_MENU_CARD_WIDTH, WATCH_MENU_CARD_HEIGHT);
+    lv_obj_set_style_radius(card, WATCH_MENU_CARD_HEIGHT / 2, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x22252A), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(card, LV_OPA_COVER, LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_color(card, lv_color_hex(0x333840), LV_STATE_PRESSED);
+    lv_obj_set_style_border_width(card, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_all(card, 0, LV_STATE_DEFAULT);
+    lv_obj_clear_flag(card, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_add_flag(card, LV_OBJ_FLAG_CLICKABLE);      // 让触摸按下状态表现为 HTML :active
+
+    create_menu_icon(card, spec->symbol, lv_color_hex(spec->color));
+
+    lv_obj_t *label = lv_label_create(card);          // 创建 HTML item-label 对应的文本对象
+    lv_label_set_text(label, spec->label);
+    lv_obj_set_style_text_font(label, &lv_font_montserrat_18, LV_STATE_DEFAULT);
+    lv_obj_set_style_text_color(label, WATCH_COLOR_WHITE, LV_STATE_DEFAULT);
+    lv_obj_set_style_text_letter_space(label, 0, LV_STATE_DEFAULT);
+    lv_obj_align(label, LV_ALIGN_LEFT_MID, 76, 0);     // 图标右侧保留 16 像素文字间距
+    lv_obj_clear_flag(label, LV_OBJ_FLAG_CLICKABLE);  // 点击事件由卡片接收
+}
+
+/**
+ * @brief 创建 HTML 设置菜单页面及其可滚动列表。
+ *
+ * @param parent 页面父对象；传入 NULL 时创建独立的 LVGL screen。
+ * @return 创建完成的菜单页面 screen。
+ * @note 所有 LVGL API 必须在 watch_lvgl_start() 的初始化锁内调用。
+ */
+static lv_obj_t *create_menu_page(lv_obj_t *parent)
+{
+    lv_obj_t *menu_page = lv_obj_create(parent);      // 创建与主表盘并列的页面容器
+
+    lv_obj_remove_style_all(menu_page);
+    lv_obj_set_size(menu_page, WATCH_FACE_DIAL_SIZE, WATCH_FACE_DIAL_SIZE);
+    lv_obj_set_pos(menu_page, 0, 0);
+    lv_obj_set_style_bg_color(menu_page, lv_color_black(), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(menu_page, LV_OPA_COVER, LV_STATE_DEFAULT);
+    lv_obj_clear_flag(menu_page, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *list = lv_obj_create(menu_page);        // 创建 HTML list-container 对应的滚动容器
+
+    lv_obj_remove_style_all(list);
+    lv_obj_set_size(list, WATCH_FACE_DIAL_SIZE, WATCH_FACE_DIAL_SIZE);
+    lv_obj_set_pos(list, 0, 0);
+    lv_obj_set_style_bg_color(list, lv_color_black(), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(list, LV_OPA_COVER, LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_top(list, WATCH_MENU_PADDING_Y, LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_bottom(list, WATCH_MENU_PADDING_Y, LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_left(list, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_right(list, 0, LV_STATE_DEFAULT);
+    lv_obj_set_style_pad_row(list, WATCH_MENU_CARD_GAP, LV_STATE_DEFAULT);
+    lv_obj_set_flex_flow(list, LV_FLEX_FLOW_COLUMN);   // 让卡片按 HTML 的单列方向自动排列
+    lv_obj_set_flex_align(
+        list,
+        LV_FLEX_ALIGN_START,
+        LV_FLEX_ALIGN_CENTER,
+        LV_FLEX_ALIGN_CENTER
+    );
+    lv_obj_set_scroll_dir(list, LV_DIR_VER);           // 6 项总高度超过 466，保留触摸上下滚动
+    lv_obj_set_scrollbar_mode(list, LV_SCROLLBAR_MODE_OFF);
+
+    for (size_t i = 0; i < sizeof(s_menu_items) / sizeof(s_menu_items[0]); ++i) {
+        create_menu_item(list, &s_menu_items[i]);     // 按 HTML 顺序创建 Display 至 System
+    }
+
+    lv_obj_t *status = create_label(                  // 对应 HTML 左上角 status-number
+        menu_page,
+        "2",
+        &lv_font_montserrat_24,
+        WATCH_COLOR_WHITE
+    );
+    lv_obj_set_pos(status, 45, 24);                   // 固定在滚动列表上层，不随列表移动
+
+    s_ui.menu_list = list;                             // 保存列表句柄，进入菜单时回到顶部
+    return menu_page;
 }
 
 /**
@@ -463,9 +615,44 @@ void ui_init(lv_display_t *display)
     lv_obj_clear_flag(screen, LV_OBJ_FLAG_SCROLLABLE);
     lv_obj_set_scrollbar_mode(screen, LV_SCROLLBAR_MODE_OFF);
 
-    create_dial(screen);                              // 先创建背景和刻度，保持在最底层
-    create_text_content(screen);                      // 创建 RTC 时间和真实电量区域
-    create_heart_metric(screen);                      // 创建左侧模拟心率区域
-    create_runner_metric(screen);                     // 创建中央完整跑步人形
-    create_weather_metric(screen);                    // 创建右侧模拟天气区域
+    create_dial(screen);                              // 保持原有根屏表盘层级，先创建背景和刻度
+    create_text_content(screen);                      // 保持 RTC 时间和真实电量区域直接挂在活动屏幕
+    create_heart_metric(screen);                      // 保持左侧模拟心率区域直接挂在活动屏幕
+    create_runner_metric(screen);                     // 保持中央完整跑步人形直接挂在活动屏幕
+    create_weather_metric(screen);                    // 保持右侧模拟天气区域直接挂在活动屏幕
+
+    s_ui.main_page = screen;                          // 保存已验证的主表盘 screen
+    s_ui.menu_page = create_menu_page(NULL);          // 创建独立的 HTML 风格菜单 screen
+    s_ui.menu_visible = false;                        // 初始页面状态与隐藏标志保持一致
+}
+
+/**
+ * @brief 在主表盘和设置菜单之间切换当前页面。
+ *
+ * @param display 由 watch_lvgl 注册并传入的 LVGL Display。
+ * @return 无返回值；Display 或页面句柄无效时忽略请求。
+ * @note 必须由 watch_lvgl_run() 在 LVGL 互斥锁内调用，不能从 GPIO ISR 直接调用。
+ */
+void watch_ui_toggle_menu(lv_display_t *display)
+{
+    if (display == NULL || display != s_ui.display ||
+        s_ui.main_page == NULL || s_ui.menu_page == NULL) {
+        return;
+    }
+
+    s_ui.menu_visible = !s_ui.menu_visible;           // 切换页面状态机
+    if (s_ui.menu_visible) {
+        lv_scr_load(s_ui.menu_page);                  // 加载独立菜单 screen，触发完整屏幕刷新
+        if (s_ui.menu_list != NULL) {
+            lv_obj_scroll_to_y(s_ui.menu_list, 0, LV_ANIM_OFF); // 每次进入从第一项开始
+        }
+    } else {
+        lv_scr_load(s_ui.main_page);                  // 加载主表盘 screen，恢复动态表盘显示
+    }
+
+    ESP_LOGI(
+        TAG,
+        "G1 菜单页面已切换: %s",
+        s_ui.menu_visible ? "显示菜单" : "显示主表盘"
+    );
 }

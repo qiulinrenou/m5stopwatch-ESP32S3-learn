@@ -6,6 +6,7 @@
 #include "esp_lcd_touch.h"
 #include "esp_log.h"
 
+#include "watch_button.h"                           // 使用独立按键模块管理 GPIO 轮询和去抖
 #include "watch_lvgl.h"                              // 使用统一LVGL
 #include "watch_ui.h"
 #include "watch_core.h"                              // 使用真实表盘数据协调任务
@@ -17,6 +18,39 @@
 #include "board_power.h"
 
 static const char *TAG = "M5STOPWATCH";
+
+/**
+ * @brief 将 G1 单击动作转发到 watch_ui 的 LVGL 页面切换函数。
+ *
+ * @param display watch_lvgl 注册的 LVGL Display。
+ * @param user_data 未使用，保持 watch_lvgl_action_t 签名。
+ * @return 无返回值；函数运行时已经持有 watch_lvgl 的 LVGL 互斥锁。
+ */
+static void toggle_menu_action(lv_display_t *display, void *user_data)
+{
+    (void)user_data;
+    ESP_LOGI(TAG, "G1 菜单切换请求已进入 LVGL 锁");
+    watch_ui_toggle_menu(display);
+}
+
+/**
+ * @brief 将 watch_button 已确认的 G1 单击事件转交给 LVGL 锁。
+ *
+ * @param user_data 未使用，保持 watch_button_click_cb_t 回调签名。
+ * @return 无返回值。
+ * @note GPIO 轮询和去抖由 watch_button 管理；本函数只通过 watch_lvgl_run() 修改 UI。
+ */
+static void g1_button_click_action(void *user_data)
+{
+    (void)user_data;
+
+    const esp_err_t result = watch_lvgl_run(toggle_menu_action, NULL);
+    if (result != ESP_OK) {
+        ESP_LOGW(TAG, "G1 菜单切换失败: %s", esp_err_to_name(result));
+    } else {
+        ESP_LOGI(TAG, "G1 菜单切换请求执行完成");
+    }
+}
 
 static esp_lcd_touch_handle_t init_touch(void)
 {
@@ -97,6 +131,15 @@ void app_main(void)
             ui_init                                     // 在运行时内部的锁内创建 UI
         )
     );
+
+    const watch_button_config_t g1_button_config = {
+        .gpio_num = WATCH_G1_BUTTON_PIN,             // 使用厂商 UserDemo 定义的 B 键 GPIO1
+        .poll_period_ms = WATCH_BUTTON_POLL_MS,       // 保持原 10 ms 轮询周期
+        .debounce_period_ms = WATCH_BUTTON_DEBOUNCE_MS, // 保持原 40 ms 稳定去抖
+        .on_click = g1_button_click_action,           // 单击后才转交给 LVGL 菜单切换路径
+        .user_data = NULL,                            // 当前菜单切换不需要额外应用层上下文
+    };
+    ESP_ERROR_CHECK(watch_button_start(&g1_button_config));
 
     const watch_core_config_t core_config = {
         .rtc_reader = watch_rtc_get_datetime,         // 注入 RX8130 读取回调，避免 core 依赖硬件细节

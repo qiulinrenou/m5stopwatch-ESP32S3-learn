@@ -30,6 +30,15 @@ typedef struct {
 void ui_init(lv_display_t *display);
 
 /**
+ * @brief 在主表盘和 HTML 风格设置菜单之间切换。
+ *
+ * @param display 由 watch_lvgl 注册并传入的 LVGL Display。
+ * @return 无返回值；Display 不匹配或页面未创建时忽略请求。
+ * @note 调用者必须已经处于 watch_lvgl_run() 的 LVGL 互斥锁内，不能从 GPIO ISR 调用。
+ */
+void watch_ui_toggle_menu(lv_display_t *display);
+
+/**
  * @brief 使用一份完整数据快照刷新主表盘。
  *
  * @param display watch_lvgl 已注册的 Display。

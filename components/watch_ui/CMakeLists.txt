@@ -6,4 +6,5 @@ idf_component_register(                 # 将 watch_ui 注册为独立的 ESP-ID
     REQUIRES
         lvgl                            # 提供 LVGL 控件、字体、样式和定时器
         esp_lvgl_adapter                # 提供兼容 LVGL 8/9 的 Display 类型
+        log                             # 提供 esp_log.h 菜单切换诊断日志
 )

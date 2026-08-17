@@ -7,6 +7,7 @@ idf_component_register(
     PRIV_REQUIRES
         M5PM1
         M5IOE1 
+        watch_button                       # main 通过独立模块使用 G1 的单击事件
         # main.c 直接包含 esp_lcd_touch_cst820.h，必须声明直接依赖。
         esp_lcd_touch_cst820
         watch_ui            # 新增：main 依赖 watch_ui 组件
