@@ -1,0 +1,543 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover" />
+    <title>极光锁定表盘 - 466x466 极致旗舰版</title>
+    <style>
+        * {
+            box-sizing: border-box;
+            user-select: none;
+            -webkit-user-select: none;
+            margin: 0;
+            padding: 0;
+        }
+
+        body, html {
+            width: 100%;
+            height: 100%;
+            background-color: #000000;
+            overflow: hidden;
+            display: flex;
+            justify-content: center;
+            align-items: center;
+            font-family: 'SF Pro Display', -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            color: #ffffff;
+        }
+
+        /* 466x466 Watch Viewport Container */
+        #watch-viewport {
+            position: relative;
+            width: 466px;
+            height: 466px;
+            max-width: 100vw;
+            max-height: 100vw;
+            border-radius: 50%;
+            overflow: hidden;
+            box-shadow: 0 0 40px rgba(0, 229, 255, 0.1), 0 0 0 2px rgba(255, 255, 255, 0.08);
+            background: #030508;
+        }
+
+        canvas {
+            display: block;
+            width: 100%;
+            height: 100%;
+            cursor: pointer;
+        }
+
+        /* HUD Overlay & Floating Tooltip */
+        .hud-overlay {
+            position: absolute;
+            inset: 0;
+            pointer-events: none;
+            display: flex;
+            flex-direction: column;
+            justify-content: flex-end;
+            align-items: center;
+            padding: 24px;
+        }
+
+        #tip {
+            position: absolute;
+            bottom: 26px;
+            color: rgba(255, 255, 255, 0.55);
+            font-size: 11px;
+            font-weight: 500;
+            letter-spacing: 2px;
+            pointer-events: none;
+            transition: opacity 0.6s cubic-bezier(0.16, 1, 0.3, 1), transform 0.6s ease;
+            text-align: center;
+            text-transform: uppercase;
+            background: rgba(5, 8, 14, 0.65);
+            padding: 5px 14px;
+            border-radius: 20px;
+            border: 1px solid rgba(255, 255, 255, 0.12);
+            backdrop-filter: blur(8px);
+        }
+
+        /* Sound Toggle Button */
+        .audio-btn {
+            position: absolute;
+            top: 18px;
+            left: 18px;
+            pointer-events: auto;
+            z-index: 10;
+            width: 26px;
+            height: 26px;
+            border-radius: 50%;
+            background: rgba(10, 15, 24, 0.6);
+            border: 1px solid rgba(255, 255, 255, 0.15);
+            color: rgba(255, 255, 255, 0.7);
+            display: flex;
+            align-items: center;
+            justify-content: center;
+            font-size: 11px;
+            cursor: pointer;
+            backdrop-filter: blur(8px);
+            transition: all 0.2s ease;
+        }
+
+        .audio-btn.active {
+            color: #00E5FF;
+            border-color: #00E5FF;
+            box-shadow: 0 0 10px rgba(0, 229, 255, 0.35);
+        }
+    </style>
+</head>
+<body>
+
+    <div id="watch-viewport">
+        <button class="audio-btn active" id="audioToggle" title="音效开关">🔊</button>
+        <canvas id="watchCanvas"></canvas>
+        <div class="hud-overlay">
+            <div id="tip">点击屏幕 : 启动极轴追踪锁定</div>
+        </div>
+    </div>
+
+    <script>
+        class SciFiAudio {
+            constructor() {
+                this.enabled = true;
+                this.ctx = null;
+            }
+
+            init() {
+                if (!this.ctx && (window.AudioContext || window.webkitAudioContext)) {
+                    const AudioCtx = window.AudioContext || window.webkitAudioContext;
+                    this.ctx = new AudioCtx();
+                }
+                if (this.ctx && this.ctx.state === 'suspended') {
+                    this.ctx.resume();
+                }
+            }
+
+            playClick(freq = 600, type = 'sine', duration = 0.08) {
+                if (!this.enabled) return;
+                try {
+                    this.init();
+                    if (!this.ctx) return;
+                    const osc = this.ctx.createOscillator();
+                    const gain = this.ctx.createGain();
+                    osc.type = type;
+                    osc.frequency.setValueAtTime(freq, this.ctx.currentTime);
+                    osc.frequency.exponentialRampToValueAtTime(Math.max(20, freq * 0.3), this.ctx.currentTime + duration);
+                    gain.gain.setValueAtTime(0.12, this.ctx.currentTime);
+                    gain.gain.exponentialRampToValueAtTime(0.001, this.ctx.currentTime + duration);
+                    osc.connect(gain);
+                    gain.connect(this.ctx.destination);
+                    osc.start();
+                    osc.stop(this.ctx.currentTime + duration);
+                } catch (e) {
+                    console.error(e);
+                }
+            }
+
+            playLockSound() {
+                if (!this.enabled) return;
+                try {
+                    this.init();
+                    if (!this.ctx) return;
+                    const now = this.ctx.currentTime;
+
+                    const osc1 = this.ctx.createOscillator();
+                    const gain1 = this.ctx.createGain();
+                    osc1.type = 'sawtooth';
+                    osc1.frequency.setValueAtTime(320, now);
+                    osc1.frequency.exponentialRampToValueAtTime(1100, now + 0.12);
+                    gain1.gain.setValueAtTime(0.09, now);
+                    gain1.gain.exponentialRampToValueAtTime(0.001, now + 0.12);
+                    osc1.connect(gain1);
+                    gain1.connect(this.ctx.destination);
+                    osc1.start(now);
+                    osc1.stop(now + 0.12);
+
+                    const osc2 = this.ctx.createOscillator();
+                    const gain2 = this.ctx.createGain();
+                    osc2.type = 'sine';
+                    osc2.frequency.setValueAtTime(880, now + 0.08);
+                    osc2.frequency.exponentialRampToValueAtTime(1760, now + 0.25);
+                    gain2.gain.setValueAtTime(0.12, now + 0.08);
+                    gain2.gain.exponentialRampToValueAtTime(0.001, now + 0.25);
+                    osc2.connect(gain2);
+                    gain2.connect(this.ctx.destination);
+                    osc2.start(now + 0.08);
+                    osc2.stop(now + 0.25);
+                } catch (e) {
+                    console.error(e);
+                }
+            }
+        }
+
+        const canvas = document.getElementById("watchCanvas");
+        const ctx = canvas.getContext("2d");
+        const tipEl = document.getElementById("tip");
+        const audioBtn = document.getElementById("audioToggle");
+        const audio = new SciFiAudio();
+
+        // 沉稳纯净科技配色（白 + 冰蓝 + 钴蓝）
+        const THEME = {
+            C_HOUR: "#FFFFFF",
+            C_MIN: "#00E5FF",
+            C_SEC: "#3A82F6",
+            C_BG: "#030508",
+            C_GRID: "rgba(255, 255, 255, 0.025)"
+        };
+
+        let isLocked = false;
+        let t_raw = 0;
+        let t = 0;
+        let width, height, cx, cy, min_dim;
+        let R_h, R_m, R_s;
+
+        function resize() {
+            const container = document.getElementById("watch-viewport");
+            const rect = container.getBoundingClientRect();
+            
+            const dpr = Math.max(window.devicePixelRatio || 1, 2);
+            width = rect.width;
+            height = rect.height;
+
+            canvas.width = width * dpr;
+            canvas.height = height * dpr;
+            ctx.resetTransform();
+            ctx.scale(dpr, dpr);
+
+            cx = width / 2;
+            cy = height / 2;
+            min_dim = Math.min(width, height);
+
+            // 精准布局 3 圈刻度半径，确保锁定时有充足空间展示右侧数字
+            R_h = min_dim * 0.15;
+            R_m = min_dim * 0.27;
+            R_s = min_dim * 0.39;
+        }
+
+        window.addEventListener("resize", resize);
+        resize();
+
+        function easeInOutCubic(x) {
+            return x < 0.5 ? 4 * x * x * x : 1 - Math.pow(-2 * x + 2, 3) / 2;
+        }
+
+        function drawBackground() {
+            ctx.save();
+            ctx.fillStyle = THEME.C_BG;
+            ctx.fillRect(0, 0, width, height);
+
+            // 中心微弱柔和底光
+            const bgGrad = ctx.createRadialGradient(cx, cy, 10, cx, cy, min_dim * 0.48);
+            bgGrad.addColorStop(0, "rgba(0, 229, 255, 0.04)");
+            bgGrad.addColorStop(1, "rgba(0, 0, 0, 0)");
+            ctx.fillStyle = bgGrad;
+            ctx.fillRect(0, 0, width, height);
+
+            // 极弱背景质感网格
+            ctx.strokeStyle = THEME.C_GRID;
+            ctx.lineWidth = 1;
+            const gridSize = 24;
+            for (let x = 0; x < width; x += gridSize) {
+                ctx.beginPath();
+                ctx.moveTo(x, 0); ctx.lineTo(x, height);
+                ctx.stroke();
+            }
+            for (let y = 0; y < height; y += gridSize) {
+                ctx.beginPath();
+                ctx.moveTo(0, y); ctx.lineTo(width, y);
+                ctx.stroke();
+            }
+
+            ctx.restore();
+        }
+
+        function drawDialLayer(R, max_val, V_current, color, t, isHour) {
+            let native_V_angle = (V_current / max_val) * 2 * Math.PI - Math.PI / 2;
+            let D_rot = -native_V_angle * t;
+            let Hand_ang = native_V_angle * (1 - t);
+
+            ctx.save();
+
+            // 刻度轨底线
+            ctx.beginPath();
+            ctx.arc(0, 0, R, 0, Math.PI * 2);
+            ctx.strokeStyle = "rgba(255, 255, 255, 0.04)";
+            ctx.lineWidth = 1;
+            ctx.stroke();
+
+            const totalTicks = 60;
+
+            for (let i = 0; i < totalTicks; i++) {
+                let isMajor = i % 5 === 0;
+                let native_a = (i / totalTicks) * 2 * Math.PI - Math.PI / 2;
+                let global_a = native_a + D_rot;
+
+                let norm_a = ((global_a % (Math.PI * 2)) + Math.PI * 2) % (Math.PI * 2);
+                if (norm_a > Math.PI) norm_a = Math.PI * 2 - norm_a;
+
+                // 锁定时，右半边的刻度衰减降低透明度，增强视觉聚焦
+                let focus_opacity = 1.0;
+                if (t > 0.01) {
+                    let falloff = Math.max(0, 1 - norm_a / (Math.PI / 3.2));
+                    focus_opacity = 0.15 + 0.85 * Math.pow(falloff, 2);
+                }
+
+                ctx.strokeStyle = color;
+                ctx.globalAlpha = focus_opacity;
+
+                let p1x = R * Math.cos(global_a);
+                let p1y = R * Math.sin(global_a);
+                let tickL = isMajor ? 10 : 4;
+                let p2x = (R - tickL) * Math.cos(global_a);
+                let p2y = (R - tickL) * Math.sin(global_a);
+
+                ctx.lineWidth = isMajor ? 2 : 1;
+                ctx.beginPath();
+                ctx.moveTo(p1x, p1y);
+                ctx.lineTo(p2x, p2y);
+                ctx.stroke();
+
+                if (isMajor) {
+                    let textDist = 18 + 8 * t;
+                    let tx = (R - tickL - textDist) * Math.cos(global_a);
+                    let ty = (R - tickL - textDist) * Math.sin(global_a);
+
+                    let val = isHour ? (i / 5) : i;
+                    if (isHour && val === 0) val = 12;
+                    let str = isHour ? val.toString() : val.toString().padStart(2, "0");
+
+                    ctx.fillStyle = color;
+                    ctx.font = `600 ${isHour ? 13 : 10}px 'SF Pro Display', system-ui, -apple-system`;
+                    ctx.textAlign = "center";
+                    ctx.textBaseline = "middle";
+
+                    if (t > 0.5 && norm_a < 0.15) {
+                        ctx.shadowColor = color;
+                        ctx.shadowBlur = 8;
+                    } else {
+                        ctx.shadowBlur = 0;
+                    }
+
+                    ctx.fillText(str, tx, ty);
+                    ctx.shadowBlur = 0;
+                }
+            }
+
+            // 绘制指针
+            ctx.globalAlpha = 1.0;
+            let hx = R * Math.cos(Hand_ang);
+            let hy = R * Math.sin(Hand_ang);
+
+            ctx.beginPath();
+            ctx.moveTo(0, 0);
+            ctx.lineTo(hx, hy);
+            ctx.lineWidth = isHour ? 4.5 : (R === R_m ? 2.5 : 1.5);
+            ctx.lineCap = "round";
+            ctx.strokeStyle = color;
+            ctx.shadowColor = color;
+            ctx.shadowBlur = 6;
+            ctx.stroke();
+            ctx.shadowBlur = 0;
+
+            ctx.restore();
+        }
+
+        function drawCleanDigitalHUD(str_h, str_m, str_s, ms) {
+            ctx.save();
+            ctx.globalAlpha = Math.pow(t, 1.2);
+
+            // 起始位置放置在最外圈刻度盘 R_s 之外 + 16px，确保百分之百不会碰撞触碰到刻度盘
+            let text_start_x = R_s + 16;
+
+            // 1. 冰蓝细激光线
+            let text_font_size = 20;
+            ctx.font = `700 ${text_font_size}px 'SF Pro Display', -apple-system, monospace`;
+            
+            // 预计算文字总长度
+            let total_text_w = 
+                ctx.measureText(str_h).width + 2 +
+                ctx.measureText(":").width + 2 +
+                ctx.measureText(str_m).width + 2 +
+                ctx.measureText(":").width + 2 +
+                ctx.measureText(str_s).width + 3 + 28;
+
+            let laser_end_x = text_start_x + total_text_w + 10;
+
+            ctx.beginPath();
+            ctx.moveTo(-width * 0.15, 0);
+            ctx.lineTo(laser_end_x, 0);
+
+            let laserGrad = ctx.createLinearGradient(-width * 0.15, 0, laser_end_x, 0);
+            laserGrad.addColorStop(0, "rgba(255, 255, 255, 0)");
+            laserGrad.addColorStop(0.35, "rgba(0, 229, 255, 0.8)");
+            laserGrad.addColorStop(0.75, "rgba(58, 130, 246, 0.8)");
+            laserGrad.addColorStop(1, "rgba(255, 255, 255, 0)");
+
+            ctx.strokeStyle = laserGrad;
+            ctx.lineWidth = 1.2;
+            ctx.stroke();
+
+            // 2. 清晰悬浮数字时钟（以指针/激光线为底座，时间悬浮在正上方）
+            ctx.textBaseline = "bottom";
+            ctx.textAlign = "left";
+
+            // 将垂直坐标 offset 设为 -5，基线贴合激光线上方，确保文字整体呈现在指针顶部
+            const y_pos = -5;
+            let cur_x = text_start_x;
+
+            // [时] 纯白
+            ctx.fillStyle = THEME.C_HOUR;
+            ctx.shadowColor = THEME.C_HOUR;
+            ctx.shadowBlur = 6;
+            ctx.fillText(str_h, cur_x, y_pos);
+            cur_x += ctx.measureText(str_h).width + 2;
+
+            // 冒号
+            ctx.fillStyle = "rgba(255, 255, 255, 0.4)";
+            ctx.shadowBlur = 0;
+            ctx.fillText(":", cur_x, y_pos);
+            cur_x += ctx.measureText(":").width + 2;
+
+            // [分] 冰蓝
+            ctx.fillStyle = THEME.C_MIN;
+            ctx.shadowColor = THEME.C_MIN;
+            ctx.shadowBlur = 6;
+            ctx.fillText(str_m, cur_x, y_pos);
+            cur_x += ctx.measureText(str_m).width + 2;
+
+            // 冒号
+            ctx.fillStyle = "rgba(255, 255, 255, 0.4)";
+            ctx.shadowBlur = 0;
+            ctx.fillText(":", cur_x, y_pos);
+            cur_x += ctx.measureText(":").width + 2;
+
+            // [秒] 钴蓝
+            ctx.fillStyle = THEME.C_SEC;
+            ctx.shadowColor = THEME.C_SEC;
+            ctx.shadowBlur = 6;
+            ctx.fillText(str_s, cur_x, y_pos);
+            cur_x += ctx.measureText(str_s).width + 3;
+
+            // 毫秒
+            let msStr = "." + Math.floor(ms / 10).toString().padStart(2, '0');
+            ctx.font = `600 11px monospace`;
+            ctx.fillStyle = "rgba(255, 255, 255, 0.6)";
+            ctx.shadowBlur = 0;
+            ctx.fillText(msStr, cur_x, y_pos - 1);
+
+            ctx.restore();
+        }
+
+        let lastTime = performance.now();
+
+        function render(time) {
+            let dt = time - lastTime;
+            lastTime = time;
+
+            const speed = 0.0022 * dt;
+            let target = isLocked ? 1 : 0;
+            if (t_raw < target) t_raw = Math.min(target, t_raw + speed);
+            if (t_raw > target) t_raw = Math.max(target, t_raw - speed);
+            t = easeInOutCubic(t_raw);
+
+            const now = new Date();
+            const ms = now.getMilliseconds();
+            const V_sec = now.getSeconds() + ms / 1000;
+            const V_min = now.getMinutes() + V_sec / 60;
+            const V_hour = (now.getHours() % 12) + V_min / 60;
+
+            let str_h = Math.floor(now.getHours()).toString().padStart(2, "0");
+            let str_m = Math.floor(now.getMinutes()).toString().padStart(2, "0");
+            let str_s = Math.floor(now.getSeconds()).toString().padStart(2, "0");
+
+            ctx.clearRect(0, 0, width, height);
+            drawBackground();
+
+            ctx.save();
+            ctx.translate(cx, cy);
+
+            // 摄像机向左平移偏移：刚好展现左侧半个表盘，右侧不穿模
+            let cam_scale = 1 + 0.22 * t;
+            let cam_x = -(R_s * 0.72) * t;
+
+            ctx.scale(cam_scale, cam_scale);
+            ctx.translate(cam_x, 0);
+
+            // 绘制 3 圈指针与刻度
+            drawDialLayer(R_h, 12, V_hour, THEME.C_HOUR, t, true);
+            drawDialLayer(R_m, 60, V_min, THEME.C_MIN, t, false);
+            drawDialLayer(R_s, 60, V_sec, THEME.C_SEC, t, false);
+
+            // 锁定时渲染无框极简数字 HUD
+            if (t > 0.001) {
+                drawCleanDigitalHUD(str_h, str_m, str_s, ms);
+            }
+
+            // 中心轴点
+            ctx.beginPath();
+            ctx.arc(0, 0, 4.5, 0, Math.PI * 2);
+            ctx.fillStyle = THEME.C_SEC;
+            ctx.shadowColor = THEME.C_SEC;
+            ctx.shadowBlur = 6;
+            ctx.fill();
+
+            ctx.beginPath();
+            ctx.arc(0, 0, 2, 0, Math.PI * 2);
+            ctx.fillStyle = "#000000";
+            ctx.shadowBlur = 0;
+            ctx.fill();
+
+            ctx.restore();
+
+            requestAnimationFrame(render);
+        }
+
+        requestAnimationFrame(render);
+
+        function toggleLock() {
+            isLocked = !isLocked;
+            tipEl.style.opacity = "0";
+
+            if (isLocked) {
+                audio.playLockSound();
+            } else {
+                audio.playClick(600, 'sine', 0.08);
+            }
+        }
+
+        canvas.addEventListener("click", () => {
+            toggleLock();
+        });
+
+        audioBtn.addEventListener("click", (e) => {
+            e.stopPropagation();
+            audio.enabled = !audio.enabled;
+            audioBtn.classList.toggle("active", audio.enabled);
+            if (audio.enabled) audio.playClick(900, 'sine', 0.05);
+        });
+
+        canvas.addEventListener("touchstart", (e) => {
+            e.preventDefault();
+            toggleLock();
+        }, { passive: false });
+    </script>
+</body>
+</html>

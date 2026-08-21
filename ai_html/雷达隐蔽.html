@@ -1,0 +1,250 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no">
+    <title>Apple Watch 8 - 雷达隐蔽极简表盘</title>
+    <style>
+        body, html {
+            margin: 0; padding: 0; width: 100%; height: 100%;
+            background-color: #030303; overflow: hidden;
+            display: flex; justify-content: center; align-items: center;
+            font-family: "SF Pro Display", -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+            user-select: none; -webkit-user-select: none;
+        }
+        canvas { display: block; position: absolute; top: 0; left: 0; z-index: 1; }
+
+        #ui-layer {
+            position: absolute; bottom: 35px; z-index: 10;
+            display: flex; flex-direction: column; align-items: center; gap: 12px;
+            pointer-events: none;
+        }
+        #tip {
+            color: rgba(255, 255, 255, 0.4); font-size: 12px; letter-spacing: 2px;
+            text-transform: uppercase; transition: opacity 0.5s ease;
+        }
+        #controls {
+            display: flex; align-items: center; justify-content: center;
+            background: rgba(20, 20, 25, 0.7); backdrop-filter: blur(10px);
+            padding: 8px 24px; border-radius: 30px; border: 1px solid rgba(255,255,255,0.1);
+            pointer-events: auto;
+        }
+        #mode-title {
+            color: #B4FF29; font-size: 13px; font-weight: bold; letter-spacing: 1.5px;
+            text-align: center; font-variant-numeric: tabular-nums;
+            font-family: monospace;
+        }
+    </style>
+</head>
+<body>
+
+    <canvas id="watchCanvas"></canvas>
+
+    <div id="ui-layer">
+        <div id="tip">点击屏幕启动解构隐蔽</div>
+        <div id="controls">
+            <div id="mode-title">雷达隐蔽 RADAR STEALTH</div>
+        </div>
+    </div>
+
+    <script>
+        const canvas = document.getElementById('watchCanvas');
+        const ctx = canvas.getContext('2d');
+
+        let isExpanded = false;
+        let t_raw = 0;
+        let t = 0;
+
+        let width, height, cx, cy, min_dim;
+        let R_h, R_m, R_s;
+
+        // 保留您原代码中的 Apple Watch 极致对比配色
+        const C_HOUR = '#FFFFFF';
+        const C_MIN  = '#B4FF29';
+        const C_SEC  = '#FF5E00';
+
+        function resize() {
+            const dpr = window.devicePixelRatio || 2;
+            width = window.innerWidth; height = window.innerHeight;
+            canvas.width = width * dpr; canvas.height = height * dpr;
+            canvas.style.width = width + 'px'; canvas.style.height = height + 'px';
+            ctx.scale(dpr, dpr);
+            cx = width / 2; cy = height / 2;
+            min_dim = Math.min(width, height);
+            R_h = min_dim * 0.16;
+            R_m = min_dim * 0.28;
+            R_s = min_dim * 0.40;
+        }
+        window.addEventListener('resize', resize);
+        resize();
+
+        function easeInOutExpo(x) {
+            return x === 0 ? 0 : x === 1 ? 1 : x < 0.5 ? Math.pow(2, 20 * x - 10) / 2 : (2 - Math.pow(2, -20 * x + 10)) / 2;
+        }
+
+        // 基于您提供的 Mode 1【雷达隐蔽】提取并增加精细刻度与数字
+        function renderRadarStealth(V_h, V_m, V_s, str_h, str_m, str_s) {
+
+            // 1. 绘制背景雷达同心圆刻度环 (背景网格)
+            ctx.save();
+            ctx.strokeStyle = "rgba(255, 255, 255, 0.08)";
+            ctx.lineWidth = 1;
+            ctx.setLineDash([2, 4]);
+            [R_h, R_m, R_s].forEach(r => {
+                ctx.beginPath();
+                ctx.arc(0, 0, r, 0, Math.PI * 2);
+                ctx.stroke();
+            });
+            ctx.restore();
+
+            // 2. 核心雷达扫描层绘制函数
+            function drawRadar(V, maxV, R, color, isHour) {
+                let cur_a = (V / maxV) * Math.PI * 2 - Math.PI / 2;
+                ctx.lineCap = 'round';
+
+                // 绘制 60 个刻度点与数字
+                for (let i = 0; i < 60; i++) {
+                    let a = (i / 60) * Math.PI * 2 - Math.PI / 2;
+                    let diff = Math.abs((a - cur_a + Math.PI * 3) % (Math.PI * 2) - Math.PI);
+
+                    // 点击展开时，非指针扫频区域隐去
+                    let alpha = 1.0 * (1 - t) + Math.max(0, 1 - diff / (Math.PI / 4)) * t;
+                    if (alpha < 0.01) continue;
+
+                    let isMajor = i % 5 === 0;
+                    ctx.globalAlpha = alpha;
+                    ctx.strokeStyle = color;
+                    ctx.lineWidth = isMajor ? (isHour ? 3 : 2) : 1;
+
+                    // 刻度线长度
+                    let tickLen = isMajor ? (isHour ? 12 : 8) : 4;
+                    ctx.beginPath();
+                    ctx.moveTo(R * Math.cos(a), R * Math.sin(a));
+                    ctx.lineTo((R - tickLen) * Math.cos(a), (R - tickLen) * Math.sin(a));
+                    ctx.stroke();
+
+                    // 加大字号的主要刻度数字
+                    if (isMajor) {
+                        let numVal = isHour ? (i / 5 || 12) : i;
+                        let textStr = numVal.toString().padStart(isHour ? 1 : 2, '0');
+                        let textDist = R - tickLen - 15;
+                        let tx = textDist * Math.cos(a);
+                        let ty = textDist * Math.sin(a);
+
+                        ctx.fillStyle = color;
+                        ctx.font = `bold ${isHour ? 16 : 13}px monospace`;
+                        ctx.textAlign = 'center';
+                        ctx.textBaseline = 'middle';
+                        ctx.fillText(textStr, tx, ty);
+                    }
+                }
+
+                ctx.globalAlpha = 1.0;
+
+                // 指针发光线 (保持您原本的实现)
+                ctx.beginPath();
+                ctx.moveTo(0, 0);
+                ctx.lineTo(R * Math.cos(cur_a), R * Math.sin(cur_a));
+                ctx.lineWidth = isHour ? 5 : (R === R_m ? 3 : 2);
+                ctx.strokeStyle = color;
+                ctx.shadowBlur = 15 * t;
+                ctx.shadowColor = color;
+                ctx.stroke();
+                ctx.shadowBlur = 0;
+
+                // 扇形扫频残影 (保持您原本的渐变填充)
+                if (t > 0) {
+                    ctx.beginPath();
+                    ctx.arc(0, 0, R, cur_a - Math.PI / 2, cur_a);
+                    ctx.lineTo(0, 0);
+                    let grad = ctx.createConicGradient(cur_a, 0, 0);
+                    grad.addColorStop(0, 'transparent');
+                    grad.addColorStop(0.75, 'transparent');
+                    grad.addColorStop(1, `${color}66`);
+                    ctx.fillStyle = grad;
+                    ctx.globalAlpha = t;
+                    ctx.fill();
+                    ctx.globalAlpha = 1.0;
+                }
+            }
+
+            // 分别绘制 时、分、秒 三层雷达圈
+            drawRadar(V_h, 12, R_h, C_HOUR, true);
+            drawRadar(V_m, 60, R_m, C_MIN, false);
+            drawRadar(V_s, 60, R_s, C_SEC, false);
+
+            // 3. 隐蔽状态下弹出的数字 HUD 显影
+            if (t > 0.05) {
+                ctx.save();
+                ctx.globalAlpha = Math.pow(t, 2);
+                ctx.font = "bold 20px monospace";
+                ctx.textAlign = "center";
+                ctx.textBaseline = "middle";
+
+                let hudY = R_s + 38;
+                ctx.fillStyle = C_MIN;
+                ctx.shadowBlur = 10;
+                ctx.shadowColor = C_MIN;
+                ctx.fillText(`${str_h}:${str_m}:${str_s}`, 0, hudY);
+                ctx.restore();
+            }
+        }
+
+        // 主渲染循环
+        let lastTime = performance.now();
+        function loop(time) {
+            let dt = time - lastTime; lastTime = time;
+            const speed = 0.0015 * dt;
+            let target = isExpanded ? 1 : 0;
+            if (t_raw < target) t_raw = Math.min(target, t_raw + speed);
+            if (t_raw > target) t_raw = Math.max(target, t_raw - speed);
+            t = easeInOutExpo(t_raw);
+
+            const now = new Date();
+            const ms = now.getMilliseconds();
+            const V_s = now.getSeconds() + ms / 1000;
+            const V_m = now.getMinutes() + V_s / 60;
+            const V_h = (now.getHours() % 12) + V_m / 60;
+
+            let str_h = Math.floor(now.getHours()).toString().padStart(2, '0');
+            let str_m = Math.floor(now.getMinutes()).toString().padStart(2, '0');
+            let str_s = Math.floor(now.getSeconds()).toString().padStart(2, '0');
+
+            ctx.clearRect(0, 0, width, height);
+            ctx.save();
+            ctx.translate(cx, cy);
+
+            // 渲染雷达隐蔽表盘
+            renderRadarStealth(V_h, V_m, V_s, str_h, str_m, str_s);
+
+            // 中心发光原点
+            ctx.beginPath();
+            ctx.arc(0, 0, 5, 0, Math.PI * 2);
+            ctx.fillStyle = C_SEC;
+            ctx.fill();
+
+            ctx.beginPath();
+            ctx.arc(0, 0, 2, 0, Math.PI * 2);
+            ctx.fillStyle = '#000';
+            ctx.fill();
+
+            ctx.restore();
+            requestAnimationFrame(loop);
+        }
+        requestAnimationFrame(loop);
+
+        // 交互逻辑
+        function toggleStealth() {
+            isExpanded = !isExpanded;
+            document.getElementById('tip').style.opacity = isExpanded ? '0' : '1';
+        }
+
+        canvas.addEventListener('click', toggleStealth);
+        canvas.addEventListener('touchstart', (e) => {
+            e.preventDefault();
+            toggleStealth();
+        });
+
+    </script>
+</body>
+</html>
