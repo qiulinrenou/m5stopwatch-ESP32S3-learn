@@ -5,6 +5,10 @@
 #include "esp_lv_adapter.h"                       // 提供 LVGL adapter 生命周期和锁
 #include "esp_log.h"                              // 提供日志接口
 
+#define WATCH_LVGL_TASK_PRIORITY       7            // 优先于普通业务任务，减少刷新抖动
+#define WATCH_LVGL_TASK_CORE_ID        1            // 固定到 ESP32-S3 第二核心
+#define WATCH_LVGL_TASK_MAX_DELAY_MS   8            // 与 8 ms LVGL 刷新周期一致
+
     static const char *TAG = "WATCH_LVGL";           // 当前模块日志标签
 
     typedef struct {
@@ -111,6 +115,9 @@
 
         esp_lv_adapter_config_t adapter_config =
             ESP_LV_ADAPTER_DEFAULT_CONFIG();            // 取得 adapter 默认任务配置
+        adapter_config.task_priority = WATCH_LVGL_TASK_PRIORITY;
+        adapter_config.task_core_id = WATCH_LVGL_TASK_CORE_ID;
+        adapter_config.task_max_delay_ms = WATCH_LVGL_TASK_MAX_DELAY_MS;
         adapter_config.stack_in_psram =
             config->use_psram;                          // 根据配置选择任务栈内存
 

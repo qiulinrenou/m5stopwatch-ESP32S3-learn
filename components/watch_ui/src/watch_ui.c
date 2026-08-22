@@ -2,16 +2,17 @@
 
 #include <stdio.h>                                   // 提供 snprintf()
 #include <string.h>                                  // 提供 memset()、strlen()
+#include <stdint.h>                                  // 提供 int16_t
 
 #include "esp_log.h"                               // 提供菜单和锁定状态日志
 #include "lvgl.h"                                  // 提供 LVGL 8 绘制、事件和定时器 API
 
 #define WATCH_FACE_SIZE                    466       // CO5300 圆屏完整绘制尺寸
 #define WATCH_FACE_CENTER                  233       // 未锁定表盘中心
-#define WATCH_FACE_HOUR_RADIUS              70       // 小时盘半径，约为屏幕的 15%
-#define WATCH_FACE_MINUTE_RADIUS           126       // 分钟盘半径，约为屏幕的 27%
-#define WATCH_FACE_SECOND_RADIUS           182       // 秒钟盘半径，约为屏幕的 39%
-#define WATCH_FACE_TIMER_PERIOD_MS          16       // 接近 HTML requestAnimationFrame 的 60 FPS 节奏
+#define WATCH_FACE_HOUR_RADIUS              89       // 小时盘半径，按满屏外圈同步放大
+#define WATCH_FACE_MINUTE_RADIUS           161       // 分钟盘半径，按满屏外圈同步放大
+#define WATCH_FACE_SECOND_RADIUS           233       // 秒钟盘半径，直达 466 x 466 屏幕四边
+#define WATCH_FACE_TIMER_PERIOD_MS           8       // S3 局部刷新目标约 120 FPS 节奏
 #define WATCH_FACE_LOCK_DURATION_MS        450       // 锁定/释放动画时长
 #define WATCH_FACE_LOCK_PROGRESS_MAX      1000       // 动画原始进度上限
 #define WATCH_FACE_TIP_WIDTH               150       // 首次操作提示宽度
@@ -44,6 +45,9 @@ typedef struct {
     bool lock_target;                                // true 表示目标为锁定状态
     bool tip_visible;                                // 首次操作提示是否可见
     bool menu_visible;                               // 当前是否显示菜单
+    lv_area_t dynamic_areas[3];                      // 未锁定三根指针上一帧脏区域
+    bool dynamic_area_valid;                         // 上一帧脏区域是否有效
+    bool redraw_full_next;                           // 状态切换后强制完整重绘一次
 } watch_ui_runtime_t;
 
 typedef struct {
@@ -67,6 +71,20 @@ typedef struct {
 
 static watch_ui_runtime_t s_ui = {0};                // watch_ui 唯一私有运行状态
 static const char *TAG = "WATCH_UI";                // 本模块日志标签
+
+/*
+ * 未锁定时三层表盘共用同一组 6 度刻度几何。预先缓存 LVGL 查表结果，
+ * 避免每一帧为 180 个刻度重复调用 720 次三角函数查表/插值。
+ */
+static int16_t s_tick_cos[60];
+static int16_t s_tick_sin[60];
+
+static const char *const s_hour_labels[12] = {
+    "12", "1", "2", "3", "4", "5", "6", "7", "8", "9", "10", "11"
+};
+static const char *const s_minute_labels[12] = {
+    "00", "05", "10", "15", "20", "25", "30", "35", "40", "45", "50", "55"
+};
 
 static const watch_menu_item_spec_t s_menu_items[] = {
     {"Display",       LV_SYMBOL_EYE_OPEN,   0xFFAA00},
@@ -143,7 +161,7 @@ static float interpolated_trig(float angle_deg, bool cosine)
  * @param radius 已包含锁定缩放的半径。
  * @param angle_deg 角度；0 度向右，90 度向下。
  * @return 对应的 LVGL 屏幕坐标。
- * @note 使用浮点三角函数保留 33 ms 秒针插值精度。
+ * @note 使用浮点三角函数保留 16 ms 刷新节奏下的秒针插值精度。
  */
 static lv_point_t polar_point(
     lv_point_t center,
@@ -153,6 +171,71 @@ static lv_point_t polar_point(
     const lv_point_t point = {
         .x = center.x + round_coord(radius * interpolated_trig(angle_deg, true)),
         .y = center.y + round_coord(radius * interpolated_trig(angle_deg, false)),
+    };
+    return point;
+}
+
+/**
+ * @brief 预计算未锁定表盘的整数刻度三角函数值。
+ * @return 无返回值。
+ * @note 只在 ui_init() 的 LVGL 上下文中调用一次，不访问硬件。
+ */
+static void prepare_tick_geometry(void)
+{
+    for (uint8_t index = 0; index < 60U; ++index) {
+        const int16_t angle = (int16_t)((index * 6U + 270U) % 360U);
+        s_tick_cos[index] = lv_trigo_cos(angle);
+        s_tick_sin[index] = lv_trigo_sin(angle);
+    }
+}
+
+/**
+ * @brief 使用缓存三角函数计算未锁定刻度坐标。
+ * @param center 当前表盘中心。
+ * @param radius 当前半径。
+ * @param index 0-59 的 6 度刻度索引。
+ * @return 对应的 LVGL 屏幕坐标。
+ * @note 只用于静态几何路径，锁定动画仍使用 polar_point() 保持亚角度精度。
+ */
+static lv_point_t cached_polar_point(
+    lv_point_t center,
+    float radius,
+    uint8_t index)
+{
+    const float scale = 1.0f / (float)LV_TRIGO_SIN_MAX;
+    const lv_point_t point = {
+        .x = center.x + round_coord(radius * (float)s_tick_cos[index] * scale),
+        .y = center.y + round_coord(radius * (float)s_tick_sin[index] * scale),
+    };
+    return point;
+}
+
+/**
+ * @brief 用一次旋转三角函数复用所有刻度的基准三角值。
+ * @param center 当前表盘中心。
+ * @param radius 当前半径。
+ * @param index 0-59 的 6 度刻度索引。
+ * @param rotation_cos 盘面旋转角余弦。
+ * @param rotation_sin 盘面旋转角正弦。
+ * @return 对应的 LVGL 屏幕坐标。
+ * @note 锁定动画每层只计算一次旋转三角函数，避免每个刻度重复查表。
+ */
+static lv_point_t rotated_cached_polar_point(
+    lv_point_t center,
+    float radius,
+    uint8_t index,
+    float rotation_cos,
+    float rotation_sin)
+{
+    const float base_cos = (float)s_tick_cos[index] /
+                           (float)LV_TRIGO_SIN_MAX;
+    const float base_sin = (float)s_tick_sin[index] /
+                           (float)LV_TRIGO_SIN_MAX;
+    const float cos_value = base_cos * rotation_cos - base_sin * rotation_sin;
+    const float sin_value = base_sin * rotation_cos + base_cos * rotation_sin;
+    const lv_point_t point = {
+        .x = center.x + round_coord(radius * cos_value),
+        .y = center.y + round_coord(radius * sin_value),
     };
     return point;
 }
@@ -325,30 +408,49 @@ static void draw_text(
 }
 
 /**
- * @brief 绘制极暗背景和中心底光。
+ * @brief 判断绘制区域是否与当前 LVGL 刷新裁剪区相交。
  * @param draw_ctx 当前 LVGL 绘制上下文。
- * @param area 全屏绘制区域。
- * @return 无返回值。
- * @note 不创建额外 LVGL 对象或像素缓冲。
+ * @param area 待绘制区域。
+ * @return true 表示至少有一个像素需要绘制。
+ * @note 用于局部刷新时跳过完全位于脏区外的静态刻度。
  */
-static void draw_background(
-    lv_draw_ctx_t *draw_ctx,
+static bool area_visible_in_clip(
+    const lv_draw_ctx_t *draw_ctx,
     const lv_area_t *area)
 {
-    lv_draw_rect_dsc_t dsc;
-    lv_draw_rect_dsc_init(&dsc);
-    dsc.bg_color = WATCH_COLOR_BG;
-    dsc.bg_opa = LV_OPA_COVER;
-    lv_draw_rect(draw_ctx, &dsc, area);
+    if (draw_ctx == NULL || draw_ctx->clip_area == NULL || area == NULL) {
+        return true;
+    }
 
-    const lv_point_t center = {
-        .x = area->x1 + WATCH_FACE_CENTER,
-        .y = area->y1 + WATCH_FACE_CENTER,
-    };
-    draw_filled_circle(draw_ctx, center, 165, WATCH_COLOR_MINUTE, 3);
-    draw_filled_circle(draw_ctx, center, 110, WATCH_COLOR_MINUTE, 4);
-    draw_filled_circle(draw_ctx, center, 58, WATCH_COLOR_MINUTE, 5);
+    return !(area->x2 < draw_ctx->clip_area->x1 ||
+             area->x1 > draw_ctx->clip_area->x2 ||
+             area->y2 < draw_ctx->clip_area->y1 ||
+             area->y1 > draw_ctx->clip_area->y2);
+}
 
+/**
+ * @brief 将两点连线的包围盒写入区域并扩展线宽余量。
+ * @param area 输出区域。
+ * @param start 线段起点。
+ * @param end 线段终点。
+ * @param padding 线宽、圆头和抗锯齿余量。
+ * @return 无返回值。
+ * @note 只用于局部刷新脏区计算和绘制裁剪。
+ */
+static void line_area(
+    lv_area_t *area,
+    lv_point_t start,
+    lv_point_t end,
+    lv_coord_t padding)
+{
+    area->x1 = start.x < end.x ? start.x : end.x;
+    area->x2 = start.x > end.x ? start.x : end.x;
+    area->y1 = start.y < end.y ? start.y : end.y;
+    area->y2 = start.y > end.y ? start.y : end.y;
+    area->x1 -= padding;
+    area->x2 += padding;
+    area->y1 -= padding;
+    area->y2 += padding;
 }
 
 /**
@@ -362,7 +464,7 @@ static void draw_background(
  * @param is_hour 是否使用 1-12 主刻度文字。
  * @param hand_width 未缩放指针宽度。
  * @return 无返回值。
- * @note 循环内不分配堆内存，只能在绘制事件中调用。
+ * @note 未锁定时使用缓存刻度几何；锁定动画复用旋转三角值，指针保留浮点插值精度。
  */
 static void draw_dial_layer(
     lv_draw_ctx_t *draw_ctx,
@@ -378,14 +480,41 @@ static void draw_dial_layer(
     const float native_current =
         current_value / max_value * 360.0f - 90.0f;
     const float dial_rotation = -native_current * state->eased_lock;
+    const bool static_geometry = state->eased_lock <= 0.0001f;
+    const float rotation_cos = static_geometry ?
+        1.0f : interpolated_trig(dial_rotation, true);
+    const float rotation_sin = static_geometry ?
+        0.0f : interpolated_trig(dial_rotation, false);
+
+    lv_draw_line_dsc_t tick_dsc;
+    lv_draw_line_dsc_init(&tick_dsc);
+    tick_dsc.color = color;
+    tick_dsc.round_start = false;
+    tick_dsc.round_end = false;
+
+    lv_draw_label_dsc_t label_dsc;
+    lv_draw_label_dsc_init(&label_dsc);
+    label_dsc.font = &lv_font_montserrat_14;
+    label_dsc.color = color;
+    label_dsc.align = LV_TEXT_ALIGN_CENTER;
+    label_dsc.letter_space = 0;
 
     lv_draw_arc_dsc_t arc_dsc;
     lv_draw_arc_dsc_init(&arc_dsc);
     arc_dsc.color = WATCH_COLOR_HOUR;
     arc_dsc.opa = 10;
     arc_dsc.width = 1;
-    lv_draw_arc(draw_ctx, &arc_dsc, &state->center,
-                (uint16_t)round_coord(scaled_radius), 0, 360);
+    const lv_coord_t arc_radius = (lv_coord_t)round_coord(scaled_radius + 2.0f);
+    const lv_area_t arc_area = {
+        .x1 = state->center.x - arc_radius,
+        .y1 = state->center.y - arc_radius,
+        .x2 = state->center.x + arc_radius,
+        .y2 = state->center.y + arc_radius,
+    };
+    if (area_visible_in_clip(draw_ctx, &arc_area)) {
+        lv_draw_arc(draw_ctx, &arc_dsc, &state->center,
+                    (uint16_t)round_coord(scaled_radius), 0, 360);
+    }
 
     for (uint8_t index = 0; index < 60U; ++index) {
         const bool major = (index % 5U) == 0U;
@@ -400,48 +529,103 @@ static void draw_dial_layer(
         }
 
         const float tick_length = major ? 10.0f : 4.0f;
-        const lv_point_t outer = polar_point(state->center, scaled_radius, angle);
-        const lv_point_t inner = polar_point(
-            state->center,
-            (radius - tick_length) * state->scale,
-            angle
-        );
-        draw_line(draw_ctx, outer, inner, color,
-                  clamp_opa(255.0f * opacity),
-                  round_coord((major ? 2.0f : 1.0f) * state->scale),
-                  false);
+        const lv_point_t outer = static_geometry ?
+            cached_polar_point(state->center, scaled_radius, index) :
+            rotated_cached_polar_point(state->center, scaled_radius, index,
+                                       rotation_cos, rotation_sin);
+        const lv_point_t inner = static_geometry ?
+            cached_polar_point(state->center,
+                               (radius - tick_length) * state->scale,
+                               index) :
+            rotated_cached_polar_point(state->center,
+                                       (radius - tick_length) * state->scale,
+                                       index, rotation_cos, rotation_sin);
+        tick_dsc.opa = clamp_opa(255.0f * opacity);
+        tick_dsc.width = round_coord((major ? 2.0f : 1.0f) * state->scale);
+        if (tick_dsc.width <= 0) {
+            tick_dsc.width = 1;
+        }
+        lv_area_t tick_area;
+        line_area(&tick_area, outer, inner, tick_dsc.width + 2);
+        if (area_visible_in_clip(draw_ctx, &tick_area)) {
+            lv_draw_line(draw_ctx, &tick_dsc, &outer, &inner);
+        }
 
         if (major) {
-            char number[4];
-            if (is_hour) {
-                const unsigned int value =
-                    index == 0U ? 12U : (unsigned int)(index / 5U);
-                (void)snprintf(number, sizeof(number), "%u", value);
-            } else {
-                (void)snprintf(number, sizeof(number), "%02u", (unsigned int)index);
-            }
+            const char *number = is_hour ?
+                s_hour_labels[index / 5U] : s_minute_labels[index / 5U];
 
             const float distance = 18.0f + 8.0f * state->eased_lock;
-            const lv_point_t text_center = polar_point(
-                state->center,
-                (radius - tick_length - distance) * state->scale,
-                angle
-            );
+            const float text_radius =
+                (radius - tick_length - distance) * state->scale;
+            const lv_point_t text_center = static_geometry ?
+                cached_polar_point(state->center, text_radius, index) :
+                rotated_cached_polar_point(state->center, text_radius, index,
+                                           rotation_cos, rotation_sin);
             const lv_area_t text_area = {
                 .x1 = text_center.x - 19,
                 .y1 = text_center.y - 8,
                 .x2 = text_center.x + 19,
                 .y2 = text_center.y + 9,
             };
-            draw_text(draw_ctx, &text_area, number, &lv_font_montserrat_14,
-                      color, clamp_opa(255.0f * opacity), LV_TEXT_ALIGN_CENTER);
+            label_dsc.opa = clamp_opa(255.0f * opacity);
+            if (area_visible_in_clip(draw_ctx, &text_area)) {
+                lv_draw_label(draw_ctx, &label_dsc, &text_area, number, NULL);
+            }
         }
     }
 
     const float hand_angle = native_current * (1.0f - state->eased_lock);
     const lv_point_t hand_end = polar_point(state->center, scaled_radius, hand_angle);
-    draw_line(draw_ctx, state->center, hand_end, color, LV_OPA_COVER,
-              round_coord(hand_width * state->scale), true);
+    tick_dsc.opa = LV_OPA_COVER;
+    tick_dsc.width = round_coord(hand_width * state->scale);
+    if (tick_dsc.width <= 0) {
+        tick_dsc.width = 1;
+    }
+    tick_dsc.round_start = true;
+    tick_dsc.round_end = true;
+    lv_area_t hand_area;
+    line_area(&hand_area, state->center, hand_end, tick_dsc.width + 3);
+    if (area_visible_in_clip(draw_ctx, &hand_area)) {
+        lv_draw_line(draw_ctx, &tick_dsc, &state->center, &hand_end);
+    }
+}
+
+/**
+ * @brief 计算未锁定状态三根指针和中心轴的最小动态脏区。
+ * @param state 当前表盘绘制状态。
+ * @param area 输出的 Display 绝对坐标区域。
+ * @return 无返回值。
+ * @note 未锁定表盘的刻度和文字不变，因此只需刷新该区域即可。
+ */
+static void build_unlocked_dynamic_areas(
+    const watch_face_draw_state_t *state,
+    lv_area_t areas[3])
+{
+    const float radii[] = {
+        WATCH_FACE_HOUR_RADIUS,
+        WATCH_FACE_MINUTE_RADIUS,
+        WATCH_FACE_SECOND_RADIUS,
+    };
+    const float max_values[] = {12.0f, 60.0f, 60.0f};
+    const float current_values[] = {
+        state->hour_value,
+        state->minute_value,
+        state->second_value,
+    };
+    const float hand_widths[] = {4.5f, 2.5f, 1.5f};
+
+    for (uint8_t index = 0; index < 3U; ++index) {
+        const float angle =
+            current_values[index] / max_values[index] * 360.0f - 90.0f;
+        const lv_point_t hand_end = polar_point(
+            state->center,
+            radii[index] * state->scale,
+            angle
+        );
+        line_area(&areas[index], state->center, hand_end,
+                  round_coord(hand_widths[index] * state->scale) + 3);
+    }
 }
 
 /**
@@ -533,6 +717,24 @@ static void draw_lock_hud(
         clamp_opa(255.0f * state->eased_lock * state->eased_lock);
     lv_coord_t x = state->center.x +
         round_coord(((float)WATCH_FACE_SECOND_RADIUS + 16.0f) * state->scale);
+    const lv_coord_t hud_width =
+        lv_txt_get_width(hour_text, (uint32_t)strlen(hour_text),
+                         &lv_font_montserrat_18, 0, LV_TEXT_FLAG_NONE) + 2 +
+        lv_txt_get_width(":", 1, &lv_font_montserrat_18, 0, LV_TEXT_FLAG_NONE) + 2 +
+        lv_txt_get_width(minute_text, (uint32_t)strlen(minute_text),
+                         &lv_font_montserrat_18, 0, LV_TEXT_FLAG_NONE) + 2 +
+        lv_txt_get_width(":", 1, &lv_font_montserrat_18, 0, LV_TEXT_FLAG_NONE) + 2 +
+        lv_txt_get_width(second_text, (uint32_t)strlen(second_text),
+                         &lv_font_montserrat_18, 0, LV_TEXT_FLAG_NONE) + 3 +
+        lv_txt_get_width(fraction_text, (uint32_t)strlen(fraction_text),
+                         &lv_font_montserrat_14, 0, LV_TEXT_FLAG_NONE);
+    const lv_coord_t hud_limit = area->x2 - 18;
+    if (x + hud_width > hud_limit) {
+        x = hud_limit - hud_width;
+    }
+    if (x < area->x1 + 4) {
+        x = area->x1 + 4;
+    }
     x = draw_hud_segment(draw_ctx, x, y, hour_text, &lv_font_montserrat_18,
                          WATCH_COLOR_HOUR, opa, 2);
     x = draw_hud_segment(draw_ctx, x, y, ":", &lv_font_montserrat_18,
@@ -626,7 +828,7 @@ static void draw_watch_face_event(lv_event_t *event)
     watch_face_draw_state_t state;
     build_draw_state(&state, &area);
 
-    draw_background(draw_ctx, &area);
+    /* 主 screen 已提供 #030508 背景，这里从表盘几何开始，避免重复整屏填充。 */
     draw_dial_layer(draw_ctx, &state, WATCH_FACE_HOUR_RADIUS, 12.0f,
                     state.hour_value, WATCH_COLOR_HOUR, true, 4.5f);
     draw_dial_layer(draw_ctx, &state, WATCH_FACE_MINUTE_RADIUS, 60.0f,
@@ -652,6 +854,8 @@ static void watch_face_press_event(lv_event_t *event)
 
     s_ui.lock_target = !s_ui.lock_target;
     s_ui.tip_visible = false;
+    s_ui.redraw_full_next = true;
+    s_ui.dynamic_area_valid = false;
     ESP_LOGI(TAG, "极轴锁定目标已切换: %s",
              s_ui.lock_target ? "锁定" : "释放");
 }
@@ -669,6 +873,7 @@ static void watch_face_timer_cb(lv_timer_t *timer)
         return;
     }
 
+    const uint16_t previous_progress = s_ui.lock_progress;
     const uint32_t now = lv_tick_get();
     uint32_t elapsed = lv_tick_elaps(s_ui.frame_tick);
     s_ui.frame_tick = now;
@@ -694,7 +899,42 @@ static void watch_face_timer_cb(lv_timer_t *timer)
 
     if (s_ui.display != NULL &&
         lv_disp_get_scr_act(s_ui.display) == s_ui.main_page) {
-        lv_obj_invalidate(face);
+        const bool settled_unlocked =
+            !s_ui.lock_target && s_ui.lock_progress == 0U;
+        const bool settled_locked =
+            s_ui.lock_target &&
+            s_ui.lock_progress == WATCH_FACE_LOCK_PROGRESS_MAX;
+        const bool animation_finished =
+            previous_progress != s_ui.lock_progress &&
+            (s_ui.lock_progress == 0U ||
+             s_ui.lock_progress == WATCH_FACE_LOCK_PROGRESS_MAX);
+
+        if (animation_finished) {
+            s_ui.redraw_full_next = true;
+            s_ui.dynamic_area_valid = false;
+        }
+
+        if (!settled_unlocked || settled_locked || s_ui.redraw_full_next) {
+            lv_obj_invalidate(face);
+            s_ui.dynamic_area_valid = false;
+            s_ui.redraw_full_next = false;
+        } else {
+            lv_area_t face_area;
+            lv_obj_get_coords(face, &face_area);
+            watch_face_draw_state_t state;
+            build_draw_state(&state, &face_area);
+
+            lv_area_t current_areas[3];
+            build_unlocked_dynamic_areas(&state, current_areas);
+            for (uint8_t index = 0; index < 3U; ++index) {
+                lv_obj_invalidate_area(face, &current_areas[index]);
+                if (s_ui.dynamic_area_valid) {
+                    lv_obj_invalidate_area(face, &s_ui.dynamic_areas[index]);
+                }
+                s_ui.dynamic_areas[index] = current_areas[index];
+            }
+            s_ui.dynamic_area_valid = true;
+        }
     }
 }
 
@@ -861,6 +1101,8 @@ void watch_ui_update(
     }
 
     if (lv_disp_get_scr_act(display) == s_ui.main_page) {
+        s_ui.redraw_full_next = false;
+        s_ui.dynamic_area_valid = false;
         lv_obj_invalidate(s_ui.face_draw);
     }
 }
@@ -886,6 +1128,8 @@ void ui_init(lv_display_t *display)
     s_ui.display = display;
     s_ui.tip_visible = true;
     s_ui.frame_tick = lv_tick_get();
+    s_ui.redraw_full_next = true;
+    prepare_tick_geometry();
 
     lv_obj_t *screen = lv_disp_get_scr_act(display);
     if (screen == NULL) {
