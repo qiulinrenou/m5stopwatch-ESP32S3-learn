@@ -1,0 +1,17 @@
+idf_component_register(
+    SRCS
+        "src/watch_ble.c"
+        "src/watch_ble_gatt.c"
+        "src/watch_ble_protocol.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "src"
+    REQUIRES
+        bt
+        nvs_flash
+        freertos
+        esp_timer
+        watch_images
+        log
+)

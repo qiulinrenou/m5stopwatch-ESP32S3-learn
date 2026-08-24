@@ -17,12 +17,14 @@ typedef struct {
     void *g1_user_data;                                // 蓝色 G1 回调对应的应用层上下文
     key_click_cb_t g2_on_click;                        // 黄色 G2 单击后调用的应用层回调，可为 NULL
     void *g2_user_data;                                // 黄色 G2 回调对应的应用层上下文
+    key_click_cb_t g2_on_long_press;                   // 黄色 G2 长按达到阈值后调用的应用层回调，可为 NULL
+    void *g2_long_press_user_data;                     // 黄色 G2 长按回调对应的应用层上下文
 } key_config_t;
 
 /**
- * @brief 初始化 G1 和 G2 的 GPIO 输入、去抖和轮询任务。
+ * @brief 初始化 G1、G2 的 GPIO 输入、去抖、单击和长按轮询任务。
  *
- * @param config 两个按键的回调配置；至少登记一个按键回调。
+ * @param config 两个按键的回调配置；至少登记一个单击或长按回调。
  * @return ESP_OK 表示按键任务已启动；重复初始化、参数无效或任务创建失败时返回错误码。
  * @note 本模块只管理 GPIO1 和 GPIO2；调用者必须在回调中通过 watch_lvgl_run() 交接 UI 操作。
  */

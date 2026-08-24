@@ -36,6 +36,11 @@ typedef struct {
     lv_obj_t *face_draw;                             // 单一自定义绘制对象，无像素缓冲
     lv_obj_t *menu_page;                             // 设置菜单独立 screen
     lv_obj_t *menu_list;                             // 可滚动设置列表
+    lv_obj_t *gallery_page;                          // 466 x 466 无装饰图片 screen
+    lv_obj_t *gallery_image;                         // 唯一全屏 lv_img
+    lv_obj_t *pairing_page;                          // BLE 动态口令 screen
+    lv_obj_t *pairing_code_label;                    // 六位口令标签
+    lv_obj_t *page_before_pairing;                   // 隐藏配对页时恢复的 screen
     lv_timer_t *animation_timer;                     // LVGL 平滑刷新定时器
     watch_ui_data_t time_snapshot;                   // 最近合法 RTC 快照
     uint32_t snapshot_tick;                          // 快照对应的 LVGL tick
@@ -45,6 +50,26 @@ typedef struct {
     bool lock_target;                                // true 表示目标为锁定状态
     bool tip_visible;                                // 首次操作提示是否可见
     bool menu_visible;                               // 当前是否显示菜单
+    bool gallery_visible;                            // 当前是否显示全屏图片
+    bool pairing_visible;                            // 当前是否显示动态口令
+    bool image_loading;                              // true 时忽略重复滑动与 G2 打开
+    bool image_delete_pending;                       // true 时图片删除事务已锁定当前图库状态
+    bool open_gallery_on_load;                       // 加载成功后是否切到图库
+    uint16_t occupied_mask;                          // 图片目录占用位图
+    uint8_t latest_slot;                             // 最近提交槽位
+    uint8_t current_slot;                            // 当前展示槽位
+    uint8_t requested_slot;                          // 正在加载的槽位
+    uint8_t pending_delete_slot;                     // 删除事务锁定的槽位
+    uint8_t deferred_slot;                           // COMPLETE 期间延迟到当前加载后的槽位
+    bool deferred_show;                              // 延迟槽位成功后自动打开图库
+    uint32_t next_request_id;                        // 单调递增加载请求编号
+    uint32_t pending_request_id;                     // 当前唯一有效请求编号
+    uint8_t *image_buffer;                           // 当前 JPEG PSRAM 数据所有权
+    size_t image_buffer_size;                        // 当前 JPEG 字节数
+    watch_ui_image_release_callback_t image_release; // 当前缓冲释放函数
+    lv_img_dsc_t image_descriptor;                   // 稳定地址的 LVGL 内存源描述符
+    watch_ui_image_request_callback_t image_request; // 应用层异步读取入口
+    void *image_request_user_data;                   // 图片读取回调上下文
     lv_area_t dynamic_areas[3];                      // 未锁定三根指针上一帧脏区域
     bool dynamic_area_valid;                         // 上一帧脏区域是否有效
     bool redraw_full_next;                           // 状态切换后强制完整重绘一次
@@ -1073,6 +1098,455 @@ static lv_obj_t *create_menu_page(lv_obj_t *parent)
 }
 
 /**
+ * @brief 在目录位图中查找当前槽位前后最近的已占用槽位。
+ *
+ * @param current 当前槽位。
+ * @param step +1 表示下一槽位，-1 表示上一槽位。
+ * @param[out] slot 找到的槽位。
+ * @return true 表示找到至少一个其他或当前已占用槽位。
+ */
+static bool find_occupied_slot(int current, int step, uint8_t *slot)
+{
+    if (slot == NULL || s_ui.occupied_mask == 0U || (step != 1 && step != -1)) {
+        return false;
+    }
+    for (int distance = 1; distance <= (int)WATCH_UI_IMAGE_SLOT_COUNT; ++distance) {
+        int candidate = current + step * distance;
+        while (candidate < 0) {
+            candidate += (int)WATCH_UI_IMAGE_SLOT_COUNT;
+        }
+        candidate %= (int)WATCH_UI_IMAGE_SLOT_COUNT;
+        if ((s_ui.occupied_mask & (1U << candidate)) != 0U) {
+            *slot = (uint8_t)candidate;
+            return true;
+        }
+    }
+    return false;
+}
+
+/**
+ * @brief 处理全屏图片上的左右滑动。
+ *
+ * @param event LVGL 手势事件。
+ * @note 加载期间保持旧图并忽略重复手势。
+ */
+static void gallery_gesture_event(lv_event_t *event)
+{
+    if (lv_event_get_code(event) != LV_EVENT_GESTURE || s_ui.image_loading ||
+        s_ui.image_delete_pending ||
+        s_ui.display == NULL || lv_disp_get_scr_act(s_ui.display) != s_ui.gallery_page) {
+        return;
+    }
+
+    lv_indev_t *indev = lv_indev_get_act();
+    if (indev == NULL) {
+        return;
+    }
+    const lv_dir_t direction = lv_indev_get_gesture_dir(indev);
+    const int step = direction == LV_DIR_LEFT ? 1 : direction == LV_DIR_RIGHT ? -1 : 0;
+    uint8_t slot = 0U;
+    if (step != 0 && find_occupied_slot(s_ui.current_slot, step, &slot)) {
+        if (slot != s_ui.current_slot) {
+            watch_ui_request_image(s_ui.display, slot, true);
+        }
+    }
+}
+
+/**
+ * @brief 创建只有一个 466 x 466 lv_img 的无装饰图库 screen。
+ *
+ * @return 创建完成的 screen。
+ */
+static lv_obj_t *create_gallery_page(void)
+{
+    lv_obj_t *page = lv_obj_create(NULL);
+    lv_obj_remove_style_all(page);
+    lv_obj_set_size(page, WATCH_UI_IMAGE_WIDTH, WATCH_UI_IMAGE_HEIGHT);
+    lv_obj_set_pos(page, 0, 0);
+    lv_obj_set_style_bg_color(page, lv_color_black(), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(page, LV_OPA_COVER, LV_STATE_DEFAULT);
+    lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+    lv_obj_set_scrollbar_mode(page, LV_SCROLLBAR_MODE_OFF);
+
+    lv_obj_t *image = lv_img_create(page);
+    lv_obj_remove_style_all(image);
+    lv_obj_set_size(image, WATCH_UI_IMAGE_WIDTH, WATCH_UI_IMAGE_HEIGHT);
+    lv_obj_set_pos(image, 0, 0);
+    lv_obj_add_flag(image, LV_OBJ_FLAG_CLICKABLE);
+    lv_obj_clear_flag(image, LV_OBJ_FLAG_GESTURE_BUBBLE);
+    lv_obj_add_event_cb(image, gallery_gesture_event, LV_EVENT_GESTURE, NULL);
+    s_ui.gallery_image = image;
+    return page;
+}
+
+/**
+ * @brief 创建首次加密配对使用的六位口令 screen。
+ *
+ * @return 创建完成的 screen。
+ */
+static lv_obj_t *create_pairing_page(void)
+{
+    lv_obj_t *page = lv_obj_create(NULL);
+    lv_obj_remove_style_all(page);
+    lv_obj_set_size(page, WATCH_FACE_SIZE, WATCH_FACE_SIZE);
+    lv_obj_set_pos(page, 0, 0);
+    lv_obj_set_style_bg_color(page, lv_color_black(), LV_STATE_DEFAULT);
+    lv_obj_set_style_bg_opa(page, LV_OPA_COVER, LV_STATE_DEFAULT);
+    lv_obj_clear_flag(page, LV_OBJ_FLAG_SCROLLABLE);
+
+    lv_obj_t *title = create_label(
+        page,
+        "BLE PAIRING",
+        &lv_font_montserrat_24,
+        WATCH_COLOR_MINUTE
+    );
+    lv_obj_align(title, LV_ALIGN_CENTER, 0, -58);
+
+    lv_obj_t *code = create_label(
+        page,
+        "000000",
+        &lv_font_montserrat_48,
+        WATCH_COLOR_HOUR
+    );
+    lv_obj_align(code, LV_ALIGN_CENTER, 0, 12);
+    s_ui.pairing_code_label = code;
+    return page;
+}
+
+/**
+ * @brief 注册图库的异步图片读取请求回调。
+ *
+ * @param callback 非阻塞读取请求回调，传入 NULL 可取消注册。
+ * @param user_data 原样传给回调的用户数据。
+ */
+void watch_ui_set_image_request_callback(
+    watch_ui_image_request_callback_t callback,
+    void *user_data
+)
+{
+    s_ui.image_request = callback;
+    s_ui.image_request_user_data = user_data;
+}
+
+/**
+ * @brief 更新图库已占用槽位和最近槽位快照。
+ *
+ * @param display watch_ui 所属 Display。
+ * @param catalog 图片目录快照。
+ */
+void watch_ui_update_image_catalog(
+    lv_display_t *display,
+    const watch_ui_image_catalog_t *catalog
+)
+{
+    if (display == NULL || display != s_ui.display || catalog == NULL) {
+        return;
+    }
+    const uint16_t valid_mask = (uint16_t)((1U << WATCH_UI_IMAGE_SLOT_COUNT) - 1U);
+    s_ui.occupied_mask = catalog->occupied_mask & valid_mask;
+    s_ui.latest_slot = catalog->latest_slot < WATCH_UI_IMAGE_SLOT_COUNT &&
+                       (s_ui.occupied_mask & (1U << catalog->latest_slot)) != 0U
+        ? catalog->latest_slot
+        : 0xFFU;
+}
+
+/**
+ * @brief 请求异步加载指定图片槽位。
+ *
+ * @param display watch_ui 所属 Display。
+ * @param slot 图片槽位编号。
+ * @param show_on_load 成功后是否自动切换到全屏图库。
+ * @return true 表示请求已提交或已记录为延迟请求。
+ */
+bool watch_ui_request_image(
+    lv_display_t *display,
+    uint8_t slot,
+    bool show_on_load
+)
+{
+    if (display == NULL || display != s_ui.display ||
+        slot >= WATCH_UI_IMAGE_SLOT_COUNT ||
+        s_ui.image_delete_pending || s_ui.image_request == NULL ||
+        (s_ui.occupied_mask & (1U << slot)) == 0U) {
+        return false;
+    }
+    if (s_ui.image_loading) {
+        if (show_on_load) {
+            s_ui.deferred_slot = slot;
+            s_ui.deferred_show = true;
+            return true;
+        }
+        return false;
+    }
+
+    ++s_ui.next_request_id;
+    if (s_ui.next_request_id == 0U) {
+        ++s_ui.next_request_id;
+    }
+    s_ui.pending_request_id = s_ui.next_request_id;
+    s_ui.requested_slot = slot;
+    s_ui.image_loading = true;
+    s_ui.open_gallery_on_load = show_on_load;
+    if (!s_ui.image_request(
+            s_ui.pending_request_id,
+            slot,
+            s_ui.image_request_user_data
+        )) {
+        s_ui.image_loading = false;
+        s_ui.open_gallery_on_load = false;
+        return false;
+    }
+    return true;
+}
+
+/**
+ * @brief 释放异步结果中仍由调用者交付的缓冲。
+ *
+ * @param result 图片结果。
+ */
+static void release_result_buffer(const watch_ui_image_result_t *result)
+{
+    if (result != NULL && result->data != NULL && result->release != NULL) {
+        result->release(result->data);
+    }
+}
+
+/**
+ * @brief 在 LVGL 锁内接管一次异步图片读取结果。
+ *
+ * @param display watch_ui 所属 Display。
+ * @param result 读取结果；成功缓冲的所有权由本函数接管。
+ */
+void watch_ui_accept_image(
+    lv_display_t *display,
+    const watch_ui_image_result_t *result
+)
+{
+    if (display == NULL || display != s_ui.display || result == NULL) {
+        release_result_buffer(result);
+        return;
+    }
+    if (!s_ui.image_loading || result->request_id != s_ui.pending_request_id ||
+        result->slot != s_ui.requested_slot) {
+        release_result_buffer(result);
+        return;
+    }
+
+    s_ui.image_loading = false;
+    const bool show = s_ui.open_gallery_on_load;
+    s_ui.open_gallery_on_load = false;
+    if (!result->success || result->data == NULL || result->release == NULL ||
+        result->size == 0U || result->size > WATCH_UI_IMAGE_MAX_SOURCE_SIZE) {
+        release_result_buffer(result);
+    } else {
+        if (s_ui.image_buffer != NULL) {
+            lv_img_cache_invalidate_src(&s_ui.image_descriptor);
+            s_ui.image_release(s_ui.image_buffer);
+        }
+        s_ui.image_buffer = result->data;
+        s_ui.image_buffer_size = result->size;
+        s_ui.image_release = result->release;
+        s_ui.image_descriptor = (lv_img_dsc_t){
+            .header = {
+                .cf = LV_IMG_CF_RAW,
+                .always_zero = 0,
+                .reserved = 0,
+                .w = WATCH_UI_IMAGE_WIDTH,
+                .h = WATCH_UI_IMAGE_HEIGHT,
+            },
+            .data_size = (uint32_t)result->size,
+            .data = result->data,
+        };
+        lv_img_set_src(s_ui.gallery_image, &s_ui.image_descriptor);
+        lv_obj_set_size(s_ui.gallery_image, WATCH_UI_IMAGE_WIDTH, WATCH_UI_IMAGE_HEIGHT);
+        lv_obj_set_pos(s_ui.gallery_image, 0, 0);
+        s_ui.current_slot = result->slot;
+
+        if (show && !s_ui.pairing_visible) {
+            s_ui.gallery_visible = true;
+            s_ui.menu_visible = false;
+            lv_scr_load(s_ui.gallery_page);
+        }
+    }
+    if (s_ui.deferred_slot < WATCH_UI_IMAGE_SLOT_COUNT) {
+        const uint8_t deferred_slot = s_ui.deferred_slot;
+        const bool deferred_show = s_ui.deferred_show;
+        s_ui.deferred_slot = 0xFFU;
+        s_ui.deferred_show = false;
+        watch_ui_request_image(display, deferred_slot, deferred_show);
+    }
+}
+
+/**
+ * @brief 在主表盘与最近图片之间切换。
+ *
+ * @param display watch_ui 所属 Display。
+ */
+void watch_ui_toggle_gallery(lv_display_t *display)
+{
+    if (display == NULL || display != s_ui.display || s_ui.gallery_page == NULL ||
+        s_ui.pairing_visible || s_ui.image_loading || s_ui.image_delete_pending) {
+        return;
+    }
+    if (lv_disp_get_scr_act(display) == s_ui.gallery_page) {
+        s_ui.gallery_visible = false;
+        s_ui.menu_visible = false;
+        lv_scr_load(s_ui.main_page);
+        s_ui.frame_tick = lv_tick_get();
+        lv_obj_invalidate(s_ui.face_draw);
+        return;
+    }
+    if (s_ui.latest_slot >= WATCH_UI_IMAGE_SLOT_COUNT) {
+        return;
+    }
+    if (s_ui.image_buffer != NULL && s_ui.current_slot == s_ui.latest_slot) {
+        s_ui.gallery_visible = true;
+        s_ui.menu_visible = false;
+        lv_scr_load(s_ui.gallery_page);
+        return;
+    }
+    watch_ui_request_image(display, s_ui.latest_slot, true);
+}
+
+/**
+ * @brief 检查并锁定当前图库图片，供应用任务在 LVGL 锁外执行删除。
+ *
+ * @param display watch_ui 所属 Display。
+ * @param[out] slot 成功时接收当前图片槽位。
+ * @return true 表示当前正显示可删除图片且已禁止手势和页面切换。
+ */
+bool watch_ui_get_deletable_image_slot(lv_display_t *display, uint8_t *slot)
+{
+    if (display == NULL || display != s_ui.display || slot == NULL ||
+        s_ui.gallery_page == NULL || lv_disp_get_scr_act(display) != s_ui.gallery_page ||
+        !s_ui.gallery_visible || s_ui.pairing_visible || s_ui.image_loading ||
+        s_ui.image_delete_pending || s_ui.image_buffer == NULL ||
+        s_ui.current_slot >= WATCH_UI_IMAGE_SLOT_COUNT ||
+        (s_ui.occupied_mask & (1U << s_ui.current_slot)) == 0U) {
+        return false;
+    }
+
+    s_ui.image_delete_pending = true;
+    s_ui.pending_delete_slot = s_ui.current_slot;
+    *slot = s_ui.current_slot;
+    return true;
+}
+
+/**
+ * @brief 解除失败删除建立的图库交互锁。
+ *
+ * @param display watch_ui 所属 Display。
+ * @param slot 先前请求删除的槽位。
+ */
+void watch_ui_cancel_image_delete(lv_display_t *display, uint8_t slot)
+{
+    if (display == NULL || display != s_ui.display ||
+        !s_ui.image_delete_pending || s_ui.pending_delete_slot != slot) {
+        return;
+    }
+    s_ui.image_delete_pending = false;
+    s_ui.pending_delete_slot = 0xFFU;
+}
+
+/**
+ * @brief 把已提交的存储删除同步到图库，并选择下一张或返回主表盘。
+ *
+ * @param display watch_ui 所属 Display。
+ * @param deleted_slot 已删除槽位。
+ * @param catalog 删除后的目录快照。
+ * @note 有剩余槽位时旧 PSRAM 缓冲保持可见，直到新槽位异步加载成功。
+ */
+void watch_ui_apply_image_deleted(
+    lv_display_t *display,
+    uint8_t deleted_slot,
+    const watch_ui_image_catalog_t *catalog
+)
+{
+    if (display == NULL || display != s_ui.display || catalog == NULL ||
+        deleted_slot >= WATCH_UI_IMAGE_SLOT_COUNT || !s_ui.image_delete_pending ||
+        s_ui.pending_delete_slot != deleted_slot) {
+        return;
+    }
+
+    s_ui.image_delete_pending = false;
+    s_ui.pending_delete_slot = 0xFFU;
+    watch_ui_update_image_catalog(display, catalog);
+
+    if (s_ui.occupied_mask != 0U) {
+        uint8_t next_slot = 0xFFU;
+        if (find_occupied_slot(deleted_slot, 1, &next_slot)) {
+            if (!watch_ui_request_image(display, next_slot, true)) {
+                ESP_LOGW(TAG, "删除槽位 %u 后加载下一槽位 %u 失败",
+                         (unsigned int)deleted_slot, (unsigned int)next_slot);
+            }
+        }
+        return;
+    }
+
+    if (s_ui.image_buffer != NULL && s_ui.image_release != NULL) {
+        lv_img_cache_invalidate_src(&s_ui.image_descriptor);
+        lv_img_set_src(s_ui.gallery_image, NULL);
+        s_ui.image_release(s_ui.image_buffer);
+    }
+    s_ui.image_buffer = NULL;
+    s_ui.image_buffer_size = 0U;
+    s_ui.image_release = NULL;
+    memset(&s_ui.image_descriptor, 0, sizeof(s_ui.image_descriptor));
+    s_ui.current_slot = 0xFFU;
+    s_ui.gallery_visible = false;
+    s_ui.menu_visible = false;
+    lv_scr_load(s_ui.main_page);
+    s_ui.frame_tick = lv_tick_get();
+    lv_obj_invalidate(s_ui.face_draw);
+}
+
+/**
+ * @brief 全屏显示 BLE 六位动态配对码。
+ *
+ * @param display watch_ui 所属 Display。
+ * @param passkey 100000 至 999999 的动态口令。
+ */
+void watch_ui_show_pairing_code(lv_display_t *display, uint32_t passkey)
+{
+    if (display == NULL || display != s_ui.display || s_ui.pairing_page == NULL ||
+        s_ui.pairing_code_label == NULL || passkey < 100000U || passkey > 999999U) {
+        return;
+    }
+    char code[7];
+    snprintf(code, sizeof(code), "%06lu", (unsigned long)passkey);
+    lv_label_set_text(s_ui.pairing_code_label, code);
+    if (!s_ui.pairing_visible) {
+        s_ui.page_before_pairing = lv_disp_get_scr_act(display);
+    }
+    s_ui.pairing_visible = true;
+    lv_scr_load(s_ui.pairing_page);
+}
+
+/**
+ * @brief 隐藏 BLE 配对码并返回进入配对页前的页面。
+ *
+ * @param display watch_ui 所属 Display。
+ */
+void watch_ui_hide_pairing_code(lv_display_t *display)
+{
+    if (display == NULL || display != s_ui.display || !s_ui.pairing_visible) {
+        return;
+    }
+    s_ui.pairing_visible = false;
+    if (lv_disp_get_scr_act(display) == s_ui.pairing_page) {
+        lv_obj_t *target = s_ui.page_before_pairing != NULL
+            ? s_ui.page_before_pairing
+            : s_ui.main_page;
+        lv_scr_load(target);
+        if (target == s_ui.main_page) {
+            s_ui.frame_tick = lv_tick_get();
+            lv_obj_invalidate(s_ui.face_draw);
+        }
+    }
+    s_ui.page_before_pairing = NULL;
+}
+
+/**
  * @brief 缓存完整数据快照作为极光表盘的时间基准。
  * @param display watch_lvgl 已注册的 Display。
  * @param data 在 LVGL 锁外读取完成的数据快照。
@@ -1123,10 +1597,19 @@ void ui_init(lv_display_t *display)
         lv_timer_del(s_ui.animation_timer);
         s_ui.animation_timer = NULL;
     }
+    if (s_ui.image_buffer != NULL && s_ui.image_release != NULL) {
+        lv_img_cache_invalidate_src(&s_ui.image_descriptor);
+        s_ui.image_release(s_ui.image_buffer);
+    }
 
     memset(&s_ui, 0, sizeof(s_ui));
     s_ui.display = display;
     s_ui.tip_visible = true;
+    s_ui.latest_slot = 0xFFU;
+    s_ui.current_slot = 0xFFU;
+    s_ui.requested_slot = 0xFFU;
+    s_ui.pending_delete_slot = 0xFFU;
+    s_ui.deferred_slot = 0xFFU;
     s_ui.frame_tick = lv_tick_get();
     s_ui.redraw_full_next = true;
     prepare_tick_geometry();
@@ -1158,6 +1641,8 @@ void ui_init(lv_display_t *display)
     s_ui.main_page = screen;
     s_ui.face_draw = face;
     s_ui.menu_page = create_menu_page(NULL);
+    s_ui.gallery_page = create_gallery_page();
+    s_ui.pairing_page = create_pairing_page();
     s_ui.menu_visible = false;
     s_ui.animation_timer = lv_timer_create(
         watch_face_timer_cb,
@@ -1178,7 +1663,10 @@ void ui_init(lv_display_t *display)
 void watch_ui_toggle_menu(lv_display_t *display)
 {
     if (display == NULL || display != s_ui.display ||
-        s_ui.main_page == NULL || s_ui.menu_page == NULL) {
+        s_ui.main_page == NULL || s_ui.menu_page == NULL ||
+        s_ui.pairing_visible || s_ui.gallery_visible ||
+        lv_disp_get_scr_act(display) == s_ui.pairing_page ||
+        lv_disp_get_scr_act(display) == s_ui.gallery_page) {
         return;
     }
 

@@ -1,0 +1,15 @@
+idf_component_register(
+    SRCS
+        "src/watch_images.c"
+        "src/watch_jpeg.c"
+    INCLUDE_DIRS
+        "include"
+    PRIV_INCLUDE_DIRS
+        "src"
+    REQUIRES
+        fatfs
+        wear_levelling
+        freertos
+        heap
+        log
+)

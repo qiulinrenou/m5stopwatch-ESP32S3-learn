@@ -12,5 +12,6 @@
 #define WATCH_G2_BUTTON_PIN   GPIO_NUM_2             // G2 黄色按键，按下时接地
 #define WATCH_BUTTON_POLL_MS  10                     // 按键轮询周期
 #define WATCH_BUTTON_DEBOUNCE_MS 40                  // 按键稳定去抖时间
+#define WATCH_BUTTON_LONG_PRESS_MS 1500U             // 黄色 G2 长按删除触发时间
 
 #endif

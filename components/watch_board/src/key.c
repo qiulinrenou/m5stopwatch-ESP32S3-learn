@@ -19,9 +19,13 @@ typedef struct {
     const char *name;                                  // 用于串口诊断的按键名称
     key_click_cb_t on_click;                           // 完整单击后调用的应用层回调
     void *user_data;                                   // 交给 on_click 的应用层上下文
+    key_click_cb_t on_long_press;                      // 持续按下达到阈值后调用的应用层回调
+    void *long_press_user_data;                        // 交给 on_long_press 的应用层上下文
     bool raw_pressed;                                  // 最近一次原始低电平按下状态
     bool stable_pressed;                               // 去抖后确认的按下状态
     TickType_t raw_changed_at;                         // 原始电平最近一次变化的时刻
+    TickType_t pressed_at;                             // 去抖确认按下的时刻
+    bool long_press_fired;                             // 本次按压是否已经发布长按并抑制单击
 } key_runtime_t;
 
 static const char *TAG = "KEY";                      // 使用按键模块专属串口日志标签
@@ -71,16 +75,18 @@ static esp_err_t key_configure(key_runtime_t *key)
     key->raw_pressed = gpio_get_level(key->gpio_num) == 0; // 记录低电平按下的初始原始状态
     key->stable_pressed = key->raw_pressed;            // 初始稳定状态与第一次采样保持一致
     key->raw_changed_at = xTaskGetTickCount();          // 从初始化完成时刻开始计算后续去抖
+    key->pressed_at = key->raw_changed_at;              // 若启动时已按住，不从未定义时刻计算长按
+    key->long_press_fired = key->stable_pressed;        // 启动时按住只等待释放，避免误触发长按或单击
     return ESP_OK;
 }
 
 /**
- * @brief 对一个按键执行一次采样、去抖和释放沿回调。
+ * @brief 对一个按键执行一次采样、去抖、长按和释放沿回调。
  *
  * @param key 指向需要处理的 G1 或 G2 运行状态。
  * @param now 本轮轮询的 FreeRTOS Tick 时刻。
  * @return 无返回值。
- * @note 不调用 LVGL；回调由应用层自行交接到 watch_lvgl_run()。
+ * @note 长按一旦触发，本次释放沿不会再发布单击；本函数不调用 LVGL。
  */
 static void key_poll(key_runtime_t *key, TickType_t now)
 {
@@ -99,14 +105,29 @@ static void key_poll(key_runtime_t *key, TickType_t now)
         ESP_LOGI(TAG, "%s 去抖确认: %s", key->name,
                  key->stable_pressed ? "按下" : "释放");
 
-        if (!key->stable_pressed && key->on_click != NULL) { // 只在完整单击的释放沿通知已登记的回调
-            key->on_click(key->user_data);             // 按键模块不直接访问 LVGL 或 UI 对象
+        if (key->stable_pressed) {
+            key->pressed_at = now;                     // 从去抖确认按下时开始计算长按时长
+            key->long_press_fired = false;             // 新一轮按压允许触发一次长按
+        } else {
+            if (!key->long_press_fired && key->on_click != NULL) {
+                key->on_click(key->user_data);         // 短按释放后才通知应用层
+            }
+            key->long_press_fired = false;             // 释放后复位，等待下一次按压
         }
+    }
+
+    if (key->stable_pressed && !key->long_press_fired &&
+        key->on_long_press != NULL &&
+        (now - key->pressed_at) >= period_to_ticks(WATCH_BUTTON_LONG_PRESS_MS)) {
+        key->long_press_fired = true;                  // 先置位，保证一个按压周期只发布一次
+        ESP_LOGI(TAG, "%s 长按确认: %u ms", key->name,
+                 (unsigned int)WATCH_BUTTON_LONG_PRESS_MS);
+        key->on_long_press(key->long_press_user_data); // 应用层负责把动作送入自己的任务队列
     }
 }
 
 /**
- * @brief 周期性轮询 G1、G2 并将确认后的单击发布到各自回调。
+ * @brief 周期性轮询 G1、G2 并将确认后的单击或长按发布到各自回调。
  *
  * @param user_data 未使用；两枚按键状态保存在本文件的静态数组中。
  * @return 不返回；任务随系统持续运行。
@@ -134,16 +155,17 @@ static void key_task(void *user_data)
 }
 
 /**
- * @brief 配置 G1、G2 的上拉输入并创建统一轮询任务。
+ * @brief 配置 G1、G2 的上拉输入并创建统一单击与长按轮询任务。
  *
- * @param config 两枚按键的应用层回调配置，至少登记一个回调。
+ * @param config 两枚按键的应用层回调配置，至少登记一个单击或长按回调。
  * @return ESP_OK 表示 GPIO 和任务均已成功创建，否则返回具体 ESP-IDF 错误码。
  * @note 本函数不访问 LVGL；G2 未登记回调时只完成硬件采样，不会影响任何页面或 UI。
  */
 esp_err_t key_init(const key_config_t *config)
 {
     if (config == NULL ||
-        (config->g1_on_click == NULL && config->g2_on_click == NULL)) { // 至少登记一个按键回调才创建轮询任务
+        (config->g1_on_click == NULL && config->g2_on_click == NULL &&
+         config->g2_on_long_press == NULL)) {           // 至少登记一个按键回调才创建轮询任务
         return ESP_ERR_INVALID_ARG;
     }
 
@@ -155,6 +177,8 @@ esp_err_t key_init(const key_config_t *config)
     s_keys[0].user_data = config->g1_user_data;        // 登记蓝色 G1 回调上下文
     s_keys[1].on_click = config->g2_on_click;          // 登记黄色 G2 的预留回调，可为 NULL
     s_keys[1].user_data = config->g2_user_data;        // 保存黄色 G2 的预留回调上下文
+    s_keys[1].on_long_press = config->g2_on_long_press; // 登记黄色 G2 长按回调，可为 NULL
+    s_keys[1].long_press_user_data = config->g2_long_press_user_data; // 保存长按上下文
 
     for (size_t index = 0; index < sizeof(s_keys) / sizeof(s_keys[0]); ++index) {
         const esp_err_t result = key_configure(&s_keys[index]); // 逐个配置两枚按键的 GPIO 输入和上拉
